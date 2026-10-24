@@ -1,5 +1,6 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import HomePage from './HomePage.jsx'
+import { supabase } from './supabase.js'
 
 const API_URL = '/api'
 const NAV_ITEMS = [
@@ -1131,69 +1132,31 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
   const [captureProgress, setCaptureProgress] = useState(0)
   const [capturing, setCapturing] = useState(false)
   const [googleLoading, setGoogleLoading] = useState(false)
-  const [showGoogleModal, setShowGoogleModal] = useState(false)
-  const [googleAccounts, setGoogleAccounts] = useState([])
-  const [loadingAccounts, setLoadingAccounts] = useState(false)
-  const [useCustomAccount, setUseCustomAccount] = useState(false)
-  const [customName, setCustomName] = useState('')
-  const [customEmail, setCustomEmail] = useState('')
   const videoRef = useRef(null)
 
-  async function openGoogleModal() {
+  async function handleGoogleSignIn() {
     setError('')
-    setShowGoogleModal(true)
-    setUseCustomAccount(false)
-    setLoadingAccounts(true)
-    try {
-      const res = await api('/auth/google/accounts')
-      if (res && res.accounts && res.accounts.length > 0) {
-        setGoogleAccounts(res.accounts)
-      } else {
-        setGoogleAccounts([
-          { id: 1, name: 'Jane Doe', email: 'owner_test@example.com', initials: 'JD' },
-          { id: 8, name: 'Alex Morgan', email: 'alex.google@example.com', initials: 'AM' }
-        ])
-      }
-    } catch {
-      setGoogleAccounts([
-        { id: 1, name: 'Jane Doe', email: 'owner_test@example.com', initials: 'JD' },
-        { id: 8, name: 'Alex Morgan', email: 'alex.google@example.com', initials: 'AM' }
-      ])
-    } finally {
-      setLoadingAccounts(false)
-    }
-  }
-
-  async function selectGoogleAccount(account) {
     setGoogleLoading(true)
-    setError('')
     try {
-      const response = await api('/auth/google', {
-        method: 'POST',
-        body: JSON.stringify({
-          email: account.email,
-          name: account.name,
-        }),
+      const redirectUrl = window.location.origin
+      const { data, error: oauthErr } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: redirectUrl,
+          queryParams: {
+            prompt: 'select_account',
+            access_type: 'offline',
+          },
+        },
       })
-      setShowGoogleModal(false)
-      onLogin(response)
+      if (oauthErr) throw oauthErr
+      if (data?.url) {
+        window.location.assign(data.url)
+      }
     } catch (err) {
-      setError(err.message || 'Google sign-in failed. Please try again.')
-    } finally {
+      setError(err.message || 'Could not connect to Google. Please check your connection.')
       setGoogleLoading(false)
     }
-  }
-
-  async function submitCustomGoogleAccount(e) {
-    e.preventDefault()
-    if (!customEmail || !customEmail.includes('@')) {
-      setError('Please enter a valid Google email address.')
-      return
-    }
-    await selectGoogleAccount({
-      email: customEmail.trim().toLowerCase(),
-      name: customName.trim() || customEmail.split('@')[0],
-    })
   }
   const streamRef = useRef(null)
   const cancelCaptureRef = useRef(false)
@@ -1386,11 +1349,11 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
               <button
                 type="button"
                 className="button button-google button-full"
-                onClick={openGoogleModal}
+                onClick={handleGoogleSignIn}
                 disabled={loading || googleLoading}
               >
                 <GoogleIcon size={18} />
-                <span>{googleLoading ? 'Signing in with Google...' : 'Continue with Google'}</span>
+                <span>{googleLoading ? 'Connecting to Google...' : 'Continue with Google'}</span>
               </button>
               <div className="auth-divider">
                 <span>or sign in with email</span>
@@ -1402,11 +1365,11 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
               <button
                 type="button"
                 className="button button-google button-full"
-                onClick={openGoogleModal}
+                onClick={handleGoogleSignIn}
                 disabled={loading || googleLoading}
               >
                 <GoogleIcon size={18} />
-                <span>{googleLoading ? 'Connecting with Google...' : 'Continue with Google'}</span>
+                <span>{googleLoading ? 'Connecting to Google...' : 'Continue with Google'}</span>
               </button>
               <div className="auth-divider">
                 <span>or register with email</span>
@@ -1502,126 +1465,7 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
           <div className="auth-footnote"><Icon name="lock" size={13} /> Your files stay yours. Always.</div>
         </div>
         <div className="auth-bottom">CLOUDGUARD <span>•</span> A PRIVATE PLACE FOR WHAT MATTERS</div>
-        {showGoogleModal && (
-          <div className="google-modal-backdrop" onClick={() => !googleLoading && setShowGoogleModal(false)}>
-            <div className="google-modal-card" onClick={(e) => e.stopPropagation()}>
-              <button 
-                type="button" 
-                className="google-modal-close" 
-                onClick={() => setShowGoogleModal(false)}
-                aria-label="Close"
-              >
-                ✕
-              </button>
 
-              <div className="google-modal-header">
-                <GoogleIcon size={32} />
-                <h2>Choose an account</h2>
-                <p>to continue to <strong>CloudGuard Vault</strong></p>
-              </div>
-
-              {!useCustomAccount ? (
-                <div className="google-account-list">
-                  {loadingAccounts ? (
-                    <div className="google-loading-state">
-                      <span>Loading registered accounts...</span>
-                    </div>
-                  ) : (
-                    <>
-                      {googleAccounts.map((acc, idx) => {
-                        const colors = ['#1a73e8', '#ea4335', '#fbbc05', '#34a853', '#9333ea', '#0891b2']
-                        const bg = colors[idx % colors.length]
-                        return (
-                          <button
-                            key={acc.id || acc.email}
-                            type="button"
-                            className="google-account-item"
-                            onClick={() => selectGoogleAccount(acc)}
-                            disabled={googleLoading}
-                          >
-                            <div className="google-account-avatar" style={{ backgroundColor: bg }}>
-                              {acc.initials || acc.name?.[0]?.toUpperCase() || 'U'}
-                            </div>
-                            <div className="google-account-info">
-                              <span className="google-account-name">{acc.name}</span>
-                              <span className="google-account-email">{acc.email}</span>
-                            </div>
-                            <span className="google-account-arrow">›</span>
-                          </button>
-                        )
-                      })}
-
-                      <button
-                        type="button"
-                        className="google-account-item google-use-another"
-                        onClick={() => setUseCustomAccount(true)}
-                        disabled={googleLoading}
-                      >
-                        <div className="google-account-avatar google-avatar-another">
-                          <Icon name="users" size={18} />
-                        </div>
-                        <div className="google-account-info">
-                          <span className="google-account-name">Use another Google account</span>
-                          <span className="google-account-email">Sign in or register a new email</span>
-                        </div>
-                        <span className="google-account-arrow">›</span>
-                      </button>
-                    </>
-                  )}
-                </div>
-              ) : (
-                <form className="google-custom-form" onSubmit={submitCustomGoogleAccount}>
-                  <div className="google-form-intro">
-                    <span>Enter your Google account details</span>
-                  </div>
-                  <div className="google-input-group">
-                    <label>Full Name</label>
-                    <input
-                      type="text"
-                      placeholder="e.g. Adarsh Hegde"
-                      value={customName}
-                      onChange={(e) => setCustomName(e.target.value)}
-                      required
-                      autoFocus
-                    />
-                  </div>
-                  <div className="google-input-group">
-                    <label>Google Email Address</label>
-                    <input
-                      type="email"
-                      placeholder="you@gmail.com"
-                      value={customEmail}
-                      onChange={(e) => setCustomEmail(e.target.value)}
-                      required
-                    />
-                  </div>
-                  <div className="google-form-actions">
-                    <button
-                      type="button"
-                      className="button button-quiet button-small"
-                      onClick={() => setUseCustomAccount(false)}
-                    >
-                      Back to accounts
-                    </button>
-                    <button
-                      type="submit"
-                      className="button button-primary button-small"
-                      disabled={googleLoading}
-                    >
-                      {googleLoading ? 'Signing in...' : 'Continue'}
-                    </button>
-                  </div>
-                </form>
-              )}
-
-              <div className="google-modal-footer">
-                <small>
-                  To continue, Google will share your name, email address, and profile details with CloudGuard.
-                </small>
-              </div>
-            </div>
-          </div>
-        )}
       </section>
     </main>
   )
@@ -1629,6 +1473,7 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
 
 function App() {
   const [token, setToken] = useState(() => localStorage.getItem('cloudguard_token') || '')
+  const [oauthProcessing, setOauthProcessing] = useState(false)
   const [guestToken, setGuestToken] = useState(() => sessionStorage.getItem('cloudguard_guest_token') || '')
   const [recipientToken, setRecipientToken] = useState(() => sessionStorage.getItem('cloudguard_recipient_token') || '')
   const [nomineeToken, setNomineeToken] = useState(() => sessionStorage.getItem('cloudguard_nominee_token') || '')
@@ -1672,6 +1517,9 @@ function App() {
         revokeFailed = true
       }
     }
+    try {
+      await supabase.auth.signOut()
+    } catch {}
     localStorage.removeItem('cloudguard_token')
     localStorage.removeItem('cloudguard_user')
     setToken('')
@@ -1718,6 +1566,115 @@ function App() {
   }, [guestToken, recipientToken, nomineeToken, reviewerToken, invitationToken])
 
   useEffect(() => { load() }, [load])
+
+  useEffect(() => {
+    // 1. Check for OAuth errors (user cancelled or provider error)
+    const hash = window.location.hash || ''
+    const search = window.location.search || ''
+
+    if (hash.includes('error=') || search.includes('error=')) {
+      const params = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : search)
+      const errDesc = params.get('error_description') || params.get('error') || 'Google sign-in was canceled or failed.'
+      window.history.replaceState(null, '', window.location.pathname)
+      setView('auth')
+      setAuthMode('login')
+      setAuthNotice(errDesc.replace(/\+/g, ' '))
+      return
+    }
+
+    // 2. Check for OAuth callback tokens or auth codes
+    const hasOAuthParams = hash.includes('access_token=') || search.includes('code=')
+    
+    if (!token && hasOAuthParams) {
+      let isMounted = true
+      setOauthProcessing(true)
+
+      async function syncOAuthUser(sbUser) {
+        if (!sbUser || !sbUser.email) {
+          throw new Error('No verified email was returned by Google.')
+        }
+        const email = sbUser.email
+        const name = sbUser.user_metadata?.full_name || sbUser.user_metadata?.name || email.split('@')[0]
+        const googleId = sbUser.identities?.find((i) => i.provider === 'google')?.id || sbUser.id
+
+        const response = await api('/auth/google', {
+          method: 'POST',
+          body: JSON.stringify({
+            email,
+            name,
+            google_id: googleId,
+            supabase_user_id: sbUser.id,
+          }),
+        })
+
+        if (!isMounted) return
+
+        window.history.replaceState(null, '', window.location.pathname)
+
+        if (response.is_new_user) {
+          notify("Welcome to CloudGuard! Let's finish securing your digital legacy.")
+        } else {
+          notify(`Welcome back, ${response.user?.name || name}!`)
+        }
+
+        handleLogin(response)
+      }
+
+      async function processOAuthReturn() {
+        try {
+          const { data: { session }, error: sessionError } = await supabase.auth.getSession()
+          if (sessionError) throw sessionError
+
+          if (session?.user) {
+            await syncOAuthUser(session.user)
+          } else {
+            const { data: authListener } = supabase.auth.onAuthStateChange(async (event, newSession) => {
+              if (newSession?.user && isMounted) {
+                authListener?.subscription?.unsubscribe()
+                try {
+                  await syncOAuthUser(newSession.user)
+                } catch (err) {
+                  if (!isMounted) return
+                  window.history.replaceState(null, '', window.location.pathname)
+                  setView('auth')
+                  setAuthMode('login')
+                  setAuthNotice(err.message || 'Failed to complete Google sign-in.')
+                } finally {
+                  if (isMounted) setOauthProcessing(false)
+                }
+              }
+            })
+
+            setTimeout(() => {
+              if (isMounted && oauthProcessing) {
+                authListener?.subscription?.unsubscribe()
+                setOauthProcessing(false)
+                window.history.replaceState(null, '', window.location.pathname)
+                setView('auth')
+                setAuthMode('login')
+                setAuthNotice('Google authentication timed out. Please try again.')
+              }
+            }, 8000)
+            return
+          }
+        } catch (err) {
+          if (!isMounted) return
+          window.history.replaceState(null, '', window.location.pathname)
+          setView('auth')
+          setAuthMode('login')
+          setAuthNotice(err.message || 'Google authentication could not be completed.')
+        } finally {
+          if (isMounted) setOauthProcessing(false)
+        }
+      }
+
+      processOAuthReturn()
+
+      return () => {
+        isMounted = false
+      }
+    }
+  }, [token, handleLogin, notify])
 
   function handleLogin(response) {
     sessionStorage.removeItem('cloudguard_guest_token')
@@ -1867,6 +1824,22 @@ function App() {
       sessionStorage.removeItem('cloudguard_guest_token')
       setGuestToken('')
     }
+  }
+
+  if (oauthProcessing) {
+    return (
+      <main className="oauth-loading-page">
+        <div className="oauth-loading-card">
+          <div className="brand" style={{ justifyContent: 'center', marginBottom: 20 }}>
+            <span className="brand-mark"><Icon name="shield" size={24} /></span>
+            <span>cloudguard<span className="brand-period">.</span></span>
+          </div>
+          <div className="oauth-spinner" />
+          <h2 style={{ fontSize: 20, fontWeight: 600, color: '#111827', margin: '16px 0 6px' }}>Signing you in...</h2>
+          <p style={{ fontSize: 14, color: '#6b7280', margin: 0 }}>Connecting with your verified Google identity</p>
+        </div>
+      </main>
+    )
   }
 
   if (invitationToken) {

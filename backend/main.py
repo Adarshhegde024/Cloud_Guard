@@ -618,9 +618,10 @@ class SecuritySettingsPayload(BaseModel):
 
 
 class GoogleAuthPayload(BaseModel):
-    email: Optional[EmailStr] = "alex.google@example.com"
-    name: Optional[str] = "Alex Morgan"
-    google_id: Optional[str] = "google-oauth-100293847"
+    email: EmailStr
+    name: Optional[str] = "Account Owner"
+    google_id: Optional[str] = None
+    supabase_user_id: Optional[str] = None
 
 
 class LoginPayload(BaseModel):
@@ -3003,35 +3004,16 @@ def register(payload: RegisterPayload) -> dict:
     return {"user": public_user(user), "message": "Account created. You can now sign in."}
 
 
-@app.get("/api/auth/google/accounts")
-def google_available_accounts() -> dict:
-    """Returns list of public owner accounts present in the system for the Google Account Chooser."""
-    with db() as connection:
-        rows = connection.execute("SELECT id, name, email FROM users ORDER BY id ASC LIMIT 10").fetchall()
-        accounts = []
-        for r in rows:
-            name = r["name"] or "User"
-            email = r["email"]
-            parts = name.split()
-            initials = (parts[0][0] + (parts[1][0] if len(parts) > 1 else "")) if parts else "U"
-            accounts.append({
-                "id": r["id"],
-                "name": name,
-                "email": email,
-                "initials": initials.upper(),
-            })
-        return {"accounts": accounts}
-
-
 @app.post("/api/auth/google")
-def google_auth(payload: Optional[GoogleAuthPayload] = None) -> dict:
+def google_auth(payload: GoogleAuthPayload) -> dict:
     """Authenticates via Google OAuth or direct Google session provider.
     Provisions a new user with secure credentials if signing in for the first time."""
-    email = (payload.email if payload and payload.email else "alex.google@example.com").strip().lower()
-    name = (payload.name if payload and payload.name else "Alex Morgan").strip()
+    email = payload.email.strip().lower()
+    name = (payload.name or "Account Owner").strip()
     
     user_dict = None
     user_id = None
+    is_new = False
     
     with db() as connection:
         user = connection.execute(
@@ -3039,6 +3021,7 @@ def google_auth(payload: Optional[GoogleAuthPayload] = None) -> dict:
         ).fetchone()
 
         if user is None:
+            is_new = True
             # Auto-provision new Google user with valid credentials & face enrollment
             random_pw = secrets.token_urlsafe(32)
             pw_hash = bcrypt.hashpw(random_pw.encode("utf-8"), bcrypt.gensalt())
@@ -3123,7 +3106,8 @@ def google_auth(payload: Optional[GoogleAuthPayload] = None) -> dict:
         "access_token": access_token,
         "token_type": "bearer",
         "user": user_dict,
-        "message": f"Successfully signed in with Google as {user_dict['name']}"
+        "is_new_user": is_new,
+        "message": "Welcome to CloudGuard. Let's finish securing your digital legacy." if is_new else f"Welcome back, {user_dict['name']}."
     }
 
 

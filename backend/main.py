@@ -190,7 +190,7 @@ class PGConnection:
 
         cur = self._conn.cursor(cursor_factory=DictCursor)
         last_id = None
-        auto_id_tables = ["USERS", "INVITATIONS", "DOCUMENTS", "RECIPIENTS", "NOMINEES", "DEATH_CASES", "CHECKINS", "AUDIT_LOGS", "RECIPIENT_EVENTS", "NOMINEE_CASE_EVENTS", "DOCUMENT_SHARES"]
+        auto_id_tables = ["USERS", "INVITATIONS", "DOCUMENTS", "RECIPIENTS", "NOMINEES", "DEATH_CASES", "CHECKINS", "AUDIT_LOGS", "RECIPIENT_EVENTS", "NOMINEE_CASE_EVENTS", "DOCUMENT_SHARES", "NOTIFICATIONS"]
         if is_insert and not has_returning and any(f"INTO {t}" in clean_sql.upper() or f"INTO PUBLIC.{t}" in clean_sql.upper() for t in auto_id_tables):
             clean_sql += " RETURNING id"
             if params is not None:

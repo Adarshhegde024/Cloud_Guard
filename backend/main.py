@@ -91,12 +91,19 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="CloudGuard API", version="1.0.0", lifespan=lifespan)
+
+cors_origins_raw = os.getenv("CLOUDGUARD_FRONTEND_ORIGINS", "")
+cors_origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
+if not cors_origins:
+    cors_origins = ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CLOUDGUARD_FRONTEND_ORIGINS", "http://localhost:5173").split(","),
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_origins=cors_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 

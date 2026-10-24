@@ -10,7 +10,7 @@ import secrets
 import sqlite3
 import tempfile
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import quote, urlencode, urlsplit

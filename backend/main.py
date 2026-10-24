@@ -33,6 +33,7 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 os.environ.setdefault("DEEPFACE_BACKEND_ENGINE", os.getenv("CLOUDGUARD_DEEPFACE_ENGINE", "tensorflow"))
 DATABASE = Path(os.getenv("CLOUDGUARD_DATABASE", str(BASE_DIR / "cloudguard.db")))
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("CLOUDGUARD_DATABASE_URL") or ""
 JWT_SECRET = os.getenv("CLOUDGUARD_JWT_SECRET") or os.getenv("JWT_SECRET") or "cloudguard-super-secure-production-jwt-token-key-2026-legacy-vault-99881"
 FILE_KEY_B64 = os.getenv("CLOUDGUARD_FILE_KEY") or os.getenv("FILE_KEY") or "jTeTWxu8FE9ztVf/Os1VUphADlOJPzpRZml2nWuEJxw="
 ENVIRONMENT = os.getenv("CLOUDGUARD_ENV", "development")
@@ -103,19 +104,117 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def is_postgres() -> bool:
+    return DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
+
+try:
+    import psycopg2
+    from psycopg2.extras import DictCursor
+except ImportError:
+    psycopg2 = None
+    DictCursor = None
+
+class PGRow(dict):
+    def __getitem__(self, key):
+        val = super().__getitem__(key)
+        if isinstance(val, memoryview):
+            return bytes(val)
+        return val
+
+    def get(self, key, default=None):
+        val = super().get(key, default)
+        if isinstance(val, memoryview):
+            return bytes(val)
+        return val
+
+class PGCursorWrapper:
+    def __init__(self, raw_cursor, lastrowid=None):
+        self._cur = raw_cursor
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        row = self._cur.fetchone()
+        if row is None:
+            return None
+        return PGRow(dict(row))
+
+    def fetchall(self):
+        rows = self._cur.fetchall()
+        return [PGRow(dict(r)) for r in rows]
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+class PGConnection:
+    def __init__(self, raw_conn):
+        self._conn = raw_conn
+
+    def execute(self, sql, params=None):
+        clean_sql = sql.strip()
+        if clean_sql.upper().startswith("PRAGMA"):
+            cur = self._conn.cursor(cursor_factory=DictCursor)
+            return PGCursorWrapper(cur)
+
+        clean_sql = re.sub(r"\?", "%s", clean_sql)
+        is_insert = clean_sql.upper().startswith("INSERT INTO")
+        has_returning = "RETURNING" in clean_sql.upper()
+
+        cur = self._conn.cursor(cursor_factory=DictCursor)
+        last_id = None
+        auto_id_tables = ["USERS", "INVITATIONS", "DOCUMENTS", "RECIPIENTS", "NOMINEES", "DEATH_CASES", "CHECKINS", "AUDIT_LOGS", "RECIPIENT_EVENTS", "NOMINEE_CASE_EVENTS", "DOCUMENT_SHARES"]
+        if is_insert and not has_returning and any(f"INTO {t}" in clean_sql.upper() or f"INTO PUBLIC.{t}" in clean_sql.upper() for t in auto_id_tables):
+            clean_sql += " RETURNING id"
+            cur.execute(clean_sql, params or ())
+            try:
+                row = cur.fetchone()
+                if row and "id" in row:
+                    last_id = row["id"]
+            except Exception:
+                pass
+        else:
+            cur.execute(clean_sql, params or ())
+        return PGCursorWrapper(cur, lastrowid=last_id)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
 @contextmanager
 def db():
-    connection = sqlite3.connect(DATABASE)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+    if is_postgres():
+        if not psycopg2:
+            raise RuntimeError("psycopg2 is required for PostgreSQL connections.")
+        raw_conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        conn = PGConnection(raw_conn)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    else:
+        connection = sqlite3.connect(DATABASE)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
 
 def encryption_key() -> bytes:
@@ -139,7 +238,9 @@ def decrypt_bytes(data: bytes) -> bytes:
     return AESGCM(encryption_key()).decrypt(data[:12], data[12:], None)
 
 
-def migrate_schema(connection: sqlite3.Connection) -> None:
+def migrate_schema(connection) -> None:
+    if is_postgres():
+        return
     user_cols = {row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
     user_additions = [
         ("checkin_frequency_value", "INTEGER NOT NULL DEFAULT 30"),
@@ -177,6 +278,10 @@ def migrate_schema(connection: sqlite3.Connection) -> None:
 
 
 def init_database() -> None:
+    if is_postgres():
+        with db() as conn:
+            conn.execute("SELECT 1 FROM users LIMIT 1;")
+        return
     with db() as connection:
         connection.executescript(
             """
@@ -1493,6 +1598,18 @@ def current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Your session is no longer active. Please sign in again.")
     return user
 
+
+@app.get("/")
+@app.head("/")
+def root_status():
+    return {
+        "status": "ok",
+        "service": "CloudGuard Vault API",
+        "version": "1.0.0",
+        "database": "postgresql" if is_postgres() else "sqlite",
+        "docs": "/docs",
+        "health": "/api/health",
+    }
 
 @app.get("/api/health")
 def health() -> dict:

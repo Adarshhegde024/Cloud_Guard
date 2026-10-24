@@ -1137,11 +1137,21 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
     setError('')
     setGoogleLoading(true)
     try {
+      let email = window.prompt('Enter your Google email address:')
+      if (!email || !email.includes('@')) {
+        if (email !== null) setError('Please enter a valid Google email address.')
+        setGoogleLoading(false)
+        return
+      }
+      email = email.trim().toLowerCase()
+      let name = window.prompt('Enter your full name:') || email.split('@')[0]
+      name = name.trim() || 'Account Owner'
+
       const response = await api('/auth/google', {
         method: 'POST',
         body: JSON.stringify({
-          email: 'alex.google@example.com',
-          name: 'Alex Morgan',
+          email,
+          name,
         }),
       })
       onLogin(response)

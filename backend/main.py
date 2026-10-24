@@ -104,6 +104,20 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def safe_fromisoformat(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, str):
+        clean_v = v.replace("Z", "+00:00")
+        try:
+            return safe_fromisoformat(clean_v)
+        except Exception:
+            return safe_fromisoformat(clean_v.split(".")[0])
+    return v
+
+
 def is_postgres() -> bool:
     return DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
 
@@ -114,18 +128,17 @@ except ImportError:
     psycopg2 = None
     DictCursor = None
 
-class PGRow(dict):
-    def __getitem__(self, key):
-        val = super().__getitem__(key)
-        if isinstance(val, memoryview):
-            return bytes(val)
-        return val
+def _normalize_pg_val(val):
+    if isinstance(val, memoryview):
+        return bytes(val)
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
+    return val
 
-    def get(self, key, default=None):
-        val = super().get(key, default)
-        if isinstance(val, memoryview):
-            return bytes(val)
-        return val
+def _make_pg_row(raw_dict):
+    if raw_dict is None:
+        return None
+    return {k: _normalize_pg_val(v) for k, v in raw_dict.items()}
 
 class PGCursorWrapper:
     def __init__(self, raw_cursor, lastrowid=None):
@@ -136,11 +149,11 @@ class PGCursorWrapper:
         row = self._cur.fetchone()
         if row is None:
             return None
-        return PGRow(dict(row))
+        return _make_pg_row(dict(row))
 
     def fetchall(self):
         rows = self._cur.fetchall()
-        return [PGRow(dict(r)) for r in rows]
+        return [_make_pg_row(dict(r)) for r in rows]
 
     @property
     def rowcount(self):
@@ -929,7 +942,7 @@ async def evaluate_owner_account_states() -> None:
                 ).fetchone()
                 last_checkin_str = last_db["created_at"] if last_db else user["created_at"]
 
-            last_checkin_dt = datetime.fromisoformat(last_checkin_str)
+            last_checkin_dt = safe_fromisoformat(last_checkin_str)
             checkin_deadline = last_checkin_dt + timedelta(seconds=freq_sec)
             checkin_deadline_iso = checkin_deadline.isoformat()
 
@@ -1040,10 +1053,10 @@ async def evaluate_owner_account_states() -> None:
             elif state == "GRACE_PERIOD":
                 grace_deadline_str = user["grace_period_deadline"]
                 if grace_deadline_str:
-                    grace_deadline = datetime.fromisoformat(grace_deadline_str)
+                    grace_deadline = safe_fromisoformat(grace_deadline_str)
                 else:
                     grace_start_str = user["grace_period_started_at"] or now_iso
-                    grace_deadline = datetime.fromisoformat(grace_start_str) + timedelta(seconds=grace_sec)
+                    grace_deadline = safe_fromisoformat(grace_start_str) + timedelta(seconds=grace_sec)
 
                 if now > grace_deadline:
                     connection.execute(
@@ -1403,7 +1416,7 @@ def recipient_principal(
             row is None
             or row["revoked_at"] is not None
             or row["email"].strip().lower() != email
-            or datetime.fromisoformat(row["expires_at"]) <= utc_now()
+            or safe_fromisoformat(row["expires_at"]) <= utc_now()
         ):
             raise HTTPException(status_code=401, detail="The recipient sign-in is no longer active.")
         return {
@@ -1449,7 +1462,7 @@ def nominee_principal(
             row is None
             or row["revoked_at"] is not None
             or row["email"].strip().lower() != email
-            or datetime.fromisoformat(row["expires_at"]) <= utc_now()
+            or safe_fromisoformat(row["expires_at"]) <= utc_now()
         ):
             raise HTTPException(status_code=401, detail="The nominee sign-in is no longer active.")
         return {
@@ -1488,7 +1501,7 @@ def reviewer_principal(
         or row["revoked_at"] is not None
         or row["email"].strip().lower() != email
         or email != REVIEWER_EMAIL
-        or datetime.fromisoformat(row["expires_at"]) <= utc_now()
+        or safe_fromisoformat(row["expires_at"]) <= utc_now()
     ):
         raise HTTPException(status_code=401, detail="The reviewer sign-in is no longer active.")
     return {"email": email, "session_id": row["id"], "role": "reviewer"}
@@ -1531,7 +1544,7 @@ def guest_principal(
             or row["invitation_revoked_at"] is not None
             or row["status"] != "claimed"
             or row["email"].strip().lower() != email
-            or datetime.fromisoformat(row["session_expires_at"]) <= utc_now()
+            or safe_fromisoformat(row["session_expires_at"]) <= utc_now()
         ):
             raise HTTPException(status_code=401, detail="The invitation sign-in is no longer active.")
         try:
@@ -1829,7 +1842,7 @@ def list_invitations(user: sqlite3.Row = Depends(current_user)) -> dict:
     invitations = []
     for row in rows:
         item = dict(row)
-        if item["status"] == "sent" and datetime.fromisoformat(item["expires_at"]) <= utc_now():
+        if item["status"] == "sent" and safe_fromisoformat(item["expires_at"]) <= utc_now():
             item["status"] = "expired"
         invitations.append(item)
     return {"invitations": invitations}
@@ -1883,7 +1896,7 @@ def preview_invitation(token: str) -> dict:
             invitation is None
             or invitation["status"] != "sent"
             or invitation["revoked_at"] is not None
-            or datetime.fromisoformat(invitation["expires_at"]) <= now
+            or safe_fromisoformat(invitation["expires_at"]) <= now
         ):
             raise HTTPException(status_code=400, detail="This invitation is invalid, expired, or already used.")
         try:
@@ -1918,7 +1931,7 @@ def claim_invitation(payload: ClaimInvitationPayload) -> dict:
             invitation is None
             or invitation["status"] != "sent"
             or invitation["revoked_at"] is not None
-            or datetime.fromisoformat(invitation["expires_at"]) <= now
+            or safe_fromisoformat(invitation["expires_at"]) <= now
         ):
             raise HTTPException(status_code=400, detail="This invitation is invalid, expired, or already used.")
         try:
@@ -1939,7 +1952,7 @@ def claim_invitation(payload: ClaimInvitationPayload) -> dict:
                 detail=f"Create a password of at least 10 characters to finish setting up your {invitation['role']} account.",
             )
 
-        session_expires_at = min(now + timedelta(hours=12), datetime.fromisoformat(invitation["expires_at"]))
+        session_expires_at = min(now + timedelta(hours=12), safe_fromisoformat(invitation["expires_at"]))
         updated = connection.execute(
             """UPDATE invitations SET status='claimed',claimed_at=?
                WHERE id=? AND status='sent' AND revoked_at IS NULL""",
@@ -3130,7 +3143,7 @@ def dashboard(user: sqlite3.Row = Depends(current_user)) -> dict:
     next_due = None
     if last and last["status"] == "success":
         next_due = (
-            datetime.fromisoformat(last["created_at"]) + timedelta(days=user["checkin_interval"])
+            safe_fromisoformat(last["created_at"]) + timedelta(days=user["checkin_interval"])
         ).isoformat()
     return {
         "user": public_user(user),
@@ -3666,7 +3679,7 @@ def create_checkin(
             passed
             and hold["status"] == "awaiting_checkin"
             and hold["ended_at"]
-            and checkin_started_at >= datetime.fromisoformat(hold["ended_at"])
+            and checkin_started_at >= safe_fromisoformat(hold["ended_at"])
         ):
             connection.execute(
                 "UPDATE medical_holds SET status='inactive',updated_at=? WHERE owner_id=?",
@@ -3832,10 +3845,10 @@ def get_owner_checkin_status(user: sqlite3.Row = Depends(current_user)) -> dict:
         rem_checkin = None
         rem_grace = None
         if u.get("next_checkin_deadline"):
-            d_dt = datetime.fromisoformat(u["next_checkin_deadline"])
+            d_dt = safe_fromisoformat(u["next_checkin_deadline"])
             rem_checkin = max(0, int((d_dt - now).total_seconds()))
         if u.get("grace_period_deadline"):
-            g_dt = datetime.fromisoformat(u["grace_period_deadline"])
+            g_dt = safe_fromisoformat(u["grace_period_deadline"])
             rem_grace = max(0, int((g_dt - now).total_seconds()))
         return {
             "status": u.get("account_state", "ACTIVE"),

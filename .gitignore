@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.venv/
+__pycache__/
+*.py[cod]
+.env
+backend/.env
+backend/.storage.key
+*.db
+*.sqlite
+*.sqlite3
+.pytest_cache/
+backend/.wheels/
+*.log
+.DS_Store
+Thumbs.db

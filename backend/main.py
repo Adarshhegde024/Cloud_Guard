@@ -3003,6 +3003,26 @@ def register(payload: RegisterPayload) -> dict:
     return {"user": public_user(user), "message": "Account created. You can now sign in."}
 
 
+@app.get("/api/auth/google/accounts")
+def google_available_accounts() -> dict:
+    """Returns list of public owner accounts present in the system for the Google Account Chooser."""
+    with db() as connection:
+        rows = connection.execute("SELECT id, name, email FROM users ORDER BY id ASC LIMIT 10").fetchall()
+        accounts = []
+        for r in rows:
+            name = r["name"] or "User"
+            email = r["email"]
+            parts = name.split()
+            initials = (parts[0][0] + (parts[1][0] if len(parts) > 1 else "")) if parts else "U"
+            accounts.append({
+                "id": r["id"],
+                "name": name,
+                "email": email,
+                "initials": initials.upper(),
+            })
+        return {"accounts": accounts}
+
+
 @app.post("/api/auth/google")
 def google_auth(payload: Optional[GoogleAuthPayload] = None) -> dict:
     """Authenticates via Google OAuth or direct Google session provider.

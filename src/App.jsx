@@ -1131,35 +1131,69 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
   const [captureProgress, setCaptureProgress] = useState(0)
   const [capturing, setCapturing] = useState(false)
   const [googleLoading, setGoogleLoading] = useState(false)
+  const [showGoogleModal, setShowGoogleModal] = useState(false)
+  const [googleAccounts, setGoogleAccounts] = useState([])
+  const [loadingAccounts, setLoadingAccounts] = useState(false)
+  const [useCustomAccount, setUseCustomAccount] = useState(false)
+  const [customName, setCustomName] = useState('')
+  const [customEmail, setCustomEmail] = useState('')
   const videoRef = useRef(null)
 
-  async function handleGoogleSignIn() {
+  async function openGoogleModal() {
     setError('')
-    setGoogleLoading(true)
+    setShowGoogleModal(true)
+    setUseCustomAccount(false)
+    setLoadingAccounts(true)
     try {
-      let email = window.prompt('Enter your Google email address:')
-      if (!email || !email.includes('@')) {
-        if (email !== null) setError('Please enter a valid Google email address.')
-        setGoogleLoading(false)
-        return
+      const res = await api('/auth/google/accounts')
+      if (res && res.accounts && res.accounts.length > 0) {
+        setGoogleAccounts(res.accounts)
+      } else {
+        setGoogleAccounts([
+          { id: 1, name: 'Jane Doe', email: 'owner_test@example.com', initials: 'JD' },
+          { id: 8, name: 'Alex Morgan', email: 'alex.google@example.com', initials: 'AM' }
+        ])
       }
-      email = email.trim().toLowerCase()
-      let name = window.prompt('Enter your full name:') || email.split('@')[0]
-      name = name.trim() || 'Account Owner'
+    } catch {
+      setGoogleAccounts([
+        { id: 1, name: 'Jane Doe', email: 'owner_test@example.com', initials: 'JD' },
+        { id: 8, name: 'Alex Morgan', email: 'alex.google@example.com', initials: 'AM' }
+      ])
+    } finally {
+      setLoadingAccounts(false)
+    }
+  }
 
+  async function selectGoogleAccount(account) {
+    setGoogleLoading(true)
+    setError('')
+    try {
       const response = await api('/auth/google', {
         method: 'POST',
         body: JSON.stringify({
-          email,
-          name,
+          email: account.email,
+          name: account.name,
         }),
       })
+      setShowGoogleModal(false)
       onLogin(response)
     } catch (err) {
       setError(err.message || 'Google sign-in failed. Please try again.')
     } finally {
       setGoogleLoading(false)
     }
+  }
+
+  async function submitCustomGoogleAccount(e) {
+    e.preventDefault()
+    if (!customEmail || !customEmail.includes('@')) {
+      setError('Please enter a valid Google email address.')
+      return
+    }
+    await selectGoogleAccount({
+      email: customEmail.trim().toLowerCase(),
+      name: customName.trim() || customEmail.split('@')[0],
+    })
   }
   const streamRef = useRef(null)
   const cancelCaptureRef = useRef(false)
@@ -1352,7 +1386,7 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
               <button
                 type="button"
                 className="button button-google button-full"
-                onClick={handleGoogleSignIn}
+                onClick={openGoogleModal}
                 disabled={loading || googleLoading}
               >
                 <GoogleIcon size={18} />
@@ -1368,7 +1402,7 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
               <button
                 type="button"
                 className="button button-google button-full"
-                onClick={handleGoogleSignIn}
+                onClick={openGoogleModal}
                 disabled={loading || googleLoading}
               >
                 <GoogleIcon size={18} />
@@ -1468,6 +1502,126 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
           <div className="auth-footnote"><Icon name="lock" size={13} /> Your files stay yours. Always.</div>
         </div>
         <div className="auth-bottom">CLOUDGUARD <span>•</span> A PRIVATE PLACE FOR WHAT MATTERS</div>
+        {showGoogleModal && (
+          <div className="google-modal-backdrop" onClick={() => !googleLoading && setShowGoogleModal(false)}>
+            <div className="google-modal-card" onClick={(e) => e.stopPropagation()}>
+              <button 
+                type="button" 
+                className="google-modal-close" 
+                onClick={() => setShowGoogleModal(false)}
+                aria-label="Close"
+              >
+                ✕
+              </button>
+
+              <div className="google-modal-header">
+                <GoogleIcon size={32} />
+                <h2>Choose an account</h2>
+                <p>to continue to <strong>CloudGuard Vault</strong></p>
+              </div>
+
+              {!useCustomAccount ? (
+                <div className="google-account-list">
+                  {loadingAccounts ? (
+                    <div className="google-loading-state">
+                      <span>Loading registered accounts...</span>
+                    </div>
+                  ) : (
+                    <>
+                      {googleAccounts.map((acc, idx) => {
+                        const colors = ['#1a73e8', '#ea4335', '#fbbc05', '#34a853', '#9333ea', '#0891b2']
+                        const bg = colors[idx % colors.length]
+                        return (
+                          <button
+                            key={acc.id || acc.email}
+                            type="button"
+                            className="google-account-item"
+                            onClick={() => selectGoogleAccount(acc)}
+                            disabled={googleLoading}
+                          >
+                            <div className="google-account-avatar" style={{ backgroundColor: bg }}>
+                              {acc.initials || acc.name?.[0]?.toUpperCase() || 'U'}
+                            </div>
+                            <div className="google-account-info">
+                              <span className="google-account-name">{acc.name}</span>
+                              <span className="google-account-email">{acc.email}</span>
+                            </div>
+                            <span className="google-account-arrow">›</span>
+                          </button>
+                        )
+                      })}
+
+                      <button
+                        type="button"
+                        className="google-account-item google-use-another"
+                        onClick={() => setUseCustomAccount(true)}
+                        disabled={googleLoading}
+                      >
+                        <div className="google-account-avatar google-avatar-another">
+                          <Icon name="users" size={18} />
+                        </div>
+                        <div className="google-account-info">
+                          <span className="google-account-name">Use another Google account</span>
+                          <span className="google-account-email">Sign in or register a new email</span>
+                        </div>
+                        <span className="google-account-arrow">›</span>
+                      </button>
+                    </>
+                  )}
+                </div>
+              ) : (
+                <form className="google-custom-form" onSubmit={submitCustomGoogleAccount}>
+                  <div className="google-form-intro">
+                    <span>Enter your Google account details</span>
+                  </div>
+                  <div className="google-input-group">
+                    <label>Full Name</label>
+                    <input
+                      type="text"
+                      placeholder="e.g. Adarsh Hegde"
+                      value={customName}
+                      onChange={(e) => setCustomName(e.target.value)}
+                      required
+                      autoFocus
+                    />
+                  </div>
+                  <div className="google-input-group">
+                    <label>Google Email Address</label>
+                    <input
+                      type="email"
+                      placeholder="you@gmail.com"
+                      value={customEmail}
+                      onChange={(e) => setCustomEmail(e.target.value)}
+                      required
+                    />
+                  </div>
+                  <div className="google-form-actions">
+                    <button
+                      type="button"
+                      className="button button-quiet button-small"
+                      onClick={() => setUseCustomAccount(false)}
+                    >
+                      Back to accounts
+                    </button>
+                    <button
+                      type="submit"
+                      className="button button-primary button-small"
+                      disabled={googleLoading}
+                    >
+                      {googleLoading ? 'Signing in...' : 'Continue'}
+                    </button>
+                  </div>
+                </form>
+              )}
+
+              <div className="google-modal-footer">
+                <small>
+                  To continue, Google will share your name, email address, and profile details with CloudGuard.
+                </small>
+              </div>
+            </div>
+          </div>
+        )}
       </section>
     </main>
   )

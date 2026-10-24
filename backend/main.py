@@ -71,7 +71,10 @@ async def lifespan(_: FastAPI):
             bcrypt.checkpw(b"configuration-check", REVIEWER_PASSWORD_HASH.encode("ascii"))
         except (ValueError, UnicodeEncodeError) as error:
             raise RuntimeError("CLOUDGUARD_REVIEWER_PASSWORD_HASH must be a bcrypt hash.") from error
-    init_database()
+    try:
+        init_database()
+    except Exception as error:
+        logger.warning(f"Initial DB check warning: {error}")
     scheduler_task = asyncio.create_task(run_background_scheduler())
     try:
         yield
@@ -109,12 +112,17 @@ def safe_fromisoformat(v):
         return None
     if isinstance(v, datetime):
         return v
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day, tzinfo=timezone.utc)
     if isinstance(v, str):
         clean_v = v.replace("Z", "+00:00")
         try:
-            return safe_fromisoformat(clean_v)
+            return datetime.fromisoformat(clean_v)
         except Exception:
-            return safe_fromisoformat(clean_v.split(".")[0])
+            try:
+                return datetime.fromisoformat(clean_v.split(".")[0])
+            except Exception:
+                return datetime.now(timezone.utc)
     return v
 
 
@@ -166,13 +174,17 @@ class PGConnection:
     def __init__(self, raw_conn):
         self._conn = raw_conn
 
+    @property
+    def in_transaction(self):
+        return True
+
     def execute(self, sql, params=None):
         clean_sql = sql.strip()
-        if clean_sql.upper().startswith("PRAGMA"):
+        if clean_sql.upper().startswith("PRAGMA") or clean_sql.upper().startswith("BEGIN"):
             cur = self._conn.cursor(cursor_factory=DictCursor)
             return PGCursorWrapper(cur)
 
-        clean_sql = re.sub(r"\?", "%s", clean_sql)
+        clean_sql = clean_sql.replace("?", "%s")
         is_insert = clean_sql.upper().startswith("INSERT INTO")
         has_returning = "RETURNING" in clean_sql.upper()
 
@@ -181,7 +193,10 @@ class PGConnection:
         auto_id_tables = ["USERS", "INVITATIONS", "DOCUMENTS", "RECIPIENTS", "NOMINEES", "DEATH_CASES", "CHECKINS", "AUDIT_LOGS", "RECIPIENT_EVENTS", "NOMINEE_CASE_EVENTS", "DOCUMENT_SHARES"]
         if is_insert and not has_returning and any(f"INTO {t}" in clean_sql.upper() or f"INTO PUBLIC.{t}" in clean_sql.upper() for t in auto_id_tables):
             clean_sql += " RETURNING id"
-            cur.execute(clean_sql, params or ())
+            if params is not None:
+                cur.execute(clean_sql, params)
+            else:
+                cur.execute(clean_sql)
             try:
                 row = cur.fetchone()
                 if row and "id" in row:
@@ -189,7 +204,10 @@ class PGConnection:
             except Exception:
                 pass
         else:
-            cur.execute(clean_sql, params or ())
+            if params is not None:
+                cur.execute(clean_sql, params)
+            else:
+                cur.execute(clean_sql)
         return PGCursorWrapper(cur, lastrowid=last_id)
 
     def commit(self):
@@ -206,7 +224,7 @@ def db():
     if is_postgres():
         if not psycopg2:
             raise RuntimeError("psycopg2 is required for PostgreSQL connections.")
-        raw_conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        raw_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
         conn = PGConnection(raw_conn)
         try:
             yield conn
@@ -915,7 +933,7 @@ def dispatch_email(to_email: str, subject: str, text: str) -> tuple[bool, str]:
         logger.warning(f"Resend notification error for {to_email}: {e}")
         return False, str(e)
 
-async def evaluate_owner_account_states() -> None:
+def evaluate_owner_account_states() -> None:
     """Evaluates all registered owners against actual timestamps. Transitions ACTIVE -> GRACE_PERIOD -> NOMINEE_CASE_ELIGIBLE."""
     now = utc_now()
     now_iso = now.isoformat()
@@ -1131,14 +1149,16 @@ async def evaluate_owner_account_states() -> None:
 
 async def run_background_scheduler() -> None:
     logger.info("CloudGuard Background Check-in Scheduler running.")
+    # Pause 5s on boot to guarantee uvicorn binds to port $PORT and completes startup immediately
+    await asyncio.sleep(5)
     while True:
         try:
-            await evaluate_owner_account_states()
+            await asyncio.to_thread(evaluate_owner_account_states)
         except asyncio.CancelledError:
             break
         except Exception as error:
             logger.error(f"Scheduler evaluation exception: {error}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(15)
 
 
 def _medical_hold_state(connection: sqlite3.Connection, owner_id: int) -> dict:

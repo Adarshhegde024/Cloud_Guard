@@ -1,7 +1,7 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import HomePage from './HomePage.jsx'
 
-const API_URL = import.meta.env.VITE_API_URL || '/api'
+const API_URL = '/api'
 const NAV_ITEMS = [
   { id: 'dashboard', label: 'Overview', icon: 'grid' },
   { id: 'documents', label: 'My documents', icon: 'file' },

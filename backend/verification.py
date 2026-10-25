@@ -34,14 +34,14 @@ _TRANSCRIBE_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
 FACE_MODEL = "Facenet"
-# OpenCV Haar cascade: ultra-fast on CPU (0MB extra RAM, ~10ms execution)
-FACE_DETECTORS = ("opencv",)
-# DeepFace's Facenet cosine default is 0.40. Keep this tighter so a different
-# person cannot pass live check-in against the owner's enrollment photos.
-FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.24"))
+# OpenCV Haar cascade + OpenCV SSD DNN: robust face detection across angles/lighting on CPU
+FACE_DETECTORS = ("opencv", "ssd")
+# DeepFace's Facenet cosine default is 0.40. Keep tighter (0.32) so different persons
+# cannot match, while genuine owner passes across natural lighting variations.
+FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.32"))
 MIN_FACE_PX = 40
-MAX_FACE_FRAME_COVERAGE = 0.82
-_FRAME_SAMPLE_FRACTIONS = (0.2, 0.45, 0.7, 0.9)
+MAX_FACE_FRAME_COVERAGE = 0.85
+_FRAME_SAMPLE_FRACTIONS = (0.15, 0.28, 0.42, 0.56, 0.70, 0.85)
 _MAX_FRAME_SIDE = 640
 _TRANSCRIBE_SECONDS = 35
 
@@ -146,13 +146,13 @@ def _frames_from_av(video_path: Path) -> list:
         else:
             kept = []
             for index, frame in enumerate(container.decode(video=0)):
-                if index % 25 == 0:
+                if index % 20 == 0:
                     array = _array_from_av_frame(frame)
                     if array is not None:
                         kept.append(array)
-                        if len(kept) >= 4:
+                        if len(kept) >= 6:
                             break
-                if index > 150:
+                if index > 200:
                     break
             frames = kept if len(kept) >= 2 else ([kept[index] for index in _sampled_indexes(len(kept))] if kept else [])
     if len(frames) < 2:
@@ -326,12 +326,15 @@ def _region_is_usable(width: int, height: int, image_shape, confidence=None) -> 
             confidence = float(confidence)
         except (TypeError, ValueError):
             confidence = None
-        if confidence is not None and 0 <= confidence < 0.45:
+        # Only reject low-confidence detections from models that output probability scores.
+        # Haar cascade returns 0 or None, which must NOT be falsely rejected.
+        if confidence is not None and 0.0 < confidence < 0.35:
             return False
     if image_shape is not None and len(image_shape) >= 2:
         frame_height, frame_width = int(image_shape[0]), int(image_shape[1])
         if frame_width > 0 and frame_height > 0:
             coverage = (width * height) / float(frame_width * frame_height)
+            # Rejects whole-frame fallback (when enforce_detection=False produces x=0, y=0, w=width, h=height)
             if coverage > MAX_FACE_FRAME_COVERAGE:
                 return False
     return True
@@ -348,15 +351,24 @@ def _region_is_usable_from_item(item: dict, image_shape) -> bool:
 
 
 def _usable_detected_face(detected, frame):
-    if not detected or len(detected) != 1:
+    if not detected:
         return None
-    face = detected[0]
-    if not _region_is_usable_from_item(face, getattr(frame, "shape", None)):
+    image_shape = getattr(frame, "shape", None)
+    usable_faces = []
+    for item in detected:
+        if _region_is_usable_from_item(item, image_shape):
+            usable_faces.append(item)
+    if not usable_faces:
         return None
-    return face
+    # Pick the largest face (the primary user in front of the camera)
+    return max(
+        usable_faces,
+        key=lambda it: (int((it.get("facial_area") or {}).get("w") or 0) *
+                        int((it.get("facial_area") or {}).get("h") or 0))
+    )
 
 
-def _safe_extract_faces(DeepFace, frame, anti_spoofing: bool):
+def _safe_extract_faces(DeepFace, frame, anti_spoofing: bool = False):
     """Call DeepFace.extract_faces and swallow non-critical errors."""
     image_shape = getattr(frame, "shape", None)
     if image_shape is None or len(image_shape) < 2 or image_shape[0] < MIN_FACE_PX or image_shape[1] < MIN_FACE_PX:
@@ -375,8 +387,6 @@ def _safe_extract_faces(DeepFace, frame, anti_spoofing: bool):
         usable = _usable_detected_face(detected, frame)
         if usable is not None:
             return [usable]
-        if not detected and not anti_spoofing:
-            break
     return []
 
 
@@ -433,18 +443,19 @@ def _identity_matches_enrollment(live_embedding, enrollment_embeddings: list) ->
 
 def _decide_face_outcome(identity_votes: int, frames_attempted: int) -> tuple[str, str]:
     """Return (face_status, face_detail) for live-vs-enrollment votes."""
-    if frames_attempted < 2:
+    if frames_attempted < 1:
         return "failed", "no_face"
-    identity_threshold = max(2, math.ceil(frames_attempted * 0.6))
+    identity_threshold = max(1, math.ceil(frames_attempted * 0.5))
     if identity_votes >= identity_threshold:
         return "passed", "matched"
     return "failed", "different_person"
 
 
-def _embedding_from_array(DeepFace, image):
+def _embedding_from_array(DeepFace, image, image_shape=None):
     """Return a single-face embedding, or None if no unambiguous face is found."""
-    image_shape = getattr(image, "shape", None)
-    if image_shape is None or len(image_shape) < 2 or image_shape[0] < MIN_FACE_PX or image_shape[1] < MIN_FACE_PX:
+    if image_shape is None:
+        image_shape = getattr(image, "shape", None)
+    if image_shape is not None and (len(image_shape) < 2 or image_shape[0] < MIN_FACE_PX or image_shape[1] < MIN_FACE_PX):
         return None
     last_error = None
     for detector in FACE_DETECTORS:
@@ -453,23 +464,26 @@ def _embedding_from_array(DeepFace, image):
                 img_path=image,
                 model_name=FACE_MODEL,
                 detector_backend=detector,
-                enforce_detection=True,
+                enforce_detection=False,
                 align=True,
             )
         except Exception as exc:
             last_error = exc
             logger.debug("Face embedding failed with %s: %s", detector, exc)
             continue
-        if not representations or len(representations) != 1:
+        if not representations:
             continue
-        item = representations[0]
-        if not _region_is_usable_from_item(item, image_shape):
+        usable_reps = [r for r in representations if _region_is_usable_from_item(r, image_shape)]
+        if not usable_reps:
             continue
-        embedding = item.get("embedding")
+        best_rep = max(
+            usable_reps,
+            key=lambda it: (int((it.get("facial_area") or {}).get("w") or 0) *
+                            int((it.get("facial_area") or {}).get("h") or 0))
+        )
+        embedding = best_rep.get("embedding")
         if embedding:
             return embedding
-        if not representations:
-            break
     if last_error:
         logger.debug("No usable face embedding: %s", last_error)
     return None
@@ -477,12 +491,13 @@ def _embedding_from_array(DeepFace, image):
 
 def _embedding_from_frame(DeepFace, cv2, frame):
     shrunk = _shrink_frame(frame, cv2)
-    embedding = _embedding_from_array(DeepFace, shrunk)
+    shape = getattr(shrunk, "shape", None)
+    embedding = _embedding_from_array(DeepFace, shrunk, image_shape=shape)
     if embedding is not None:
         return embedding
     path = _save_frame_as_temp_image(shrunk, cv2)
     try:
-        return _embedding_from_array(DeepFace, path)
+        return _embedding_from_array(DeepFace, path, image_shape=shape)
     finally:
         try:
             os.remove(path)
@@ -530,7 +545,7 @@ def _check_frame_liveness(frames, cv2) -> bool:
     diffs = [float(cv2.absdiff(grays[i], grays[i + 1]).mean()) for i in range(len(grays) - 1)]
     max_motion = max(diffs) if diffs else 0.0
 
-    return bool(avg_sharpness >= 35.0 and max_motion >= 0.8)
+    return bool(avg_sharpness >= 25.0 and max_motion >= 0.5)
 
 
 def _enrollment_cache_key(encoded_samples: list[str]) -> str:
@@ -720,7 +735,7 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
         samples_file = f.name
 
     script = (
-        "import sys, os, json\n"
+        "import sys, os, json, traceback\n"
         "os.environ['PYTHONIOENCODING'] = 'utf-8'\n"
         "os.environ['PYTHONUTF8'] = '1'\n"
         "os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'\n"
@@ -734,10 +749,15 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
         "    from verification import _evaluate_face_and_liveness\n"
         "except ImportError:\n"
         "    from backend.verification import _evaluate_face_and_liveness\n"
-        f"with open(r'{samples_file.replace(chr(92), '/')}', 'r', encoding='utf-8') as f:\n"
-        "    samples = json.load(f)\n"
-        f"res = _evaluate_face_and_liveness(Path(r'{str(video_path).replace(chr(92), '/')}'), samples)\n"
-        "print('__FACE_RESULT__:' + json.dumps(res))\n"
+        "try:\n"
+        f"    with open(r'{samples_file.replace(chr(92), '/')}', 'r', encoding='utf-8') as f:\n"
+        "        samples = json.load(f)\n"
+        f"    res = _evaluate_face_and_liveness(Path(r'{str(video_path).replace(chr(92), '/')}'), samples)\n"
+        "    print('__FACE_RESULT__:' + json.dumps(res))\n"
+        "except Exception as exc:\n"
+        "    print('__FACE_ERROR__:' + str(exc))\n"
+        "    traceback.print_exc()\n"
+        "    sys.exit(1)\n"
     )
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
@@ -756,23 +776,102 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
             timeout=45,
         )
         face_result = None
+        worker_error = None
         for line in proc.stdout.splitlines():
             line_str = line.strip()
             if line_str.startswith("[FACE]") or line_str.startswith("[MODEL]") or line_str.startswith("[CHECKIN]"):
                 logger.info(line_str)
             elif line_str.startswith("__FACE_RESULT__:"):
                 face_result = json.loads(line_str.split("__FACE_RESULT__:", 1)[1].strip())
+            elif line_str.startswith("__FACE_ERROR__:"):
+                worker_error = line_str.split("__FACE_ERROR__:", 1)[1].strip()
         if face_result is not None:
             return face_result
-        logger.warning("Face worker output: %s (err: %s)", proc.stdout, proc.stderr)
+        logger.warning("Face worker failed. Output: %s (err: %s)", proc.stdout, proc.stderr)
+        if worker_error or proc.returncode != 0:
+            raise VerificationUnavailable(
+                f"Face verification service is temporarily unavailable: {worker_error or 'process terminated'}"
+            )
+    except subprocess.TimeoutExpired as exc:
+        logger.error("Face worker timed out: %s", exc)
+        raise VerificationUnavailable("Face verification timed out.") from exc
     except Exception as exc:
         logger.warning("Face worker error: %s", exc)
+        if isinstance(exc, VerificationUnavailable):
+            raise
+        raise VerificationUnavailable("Face verification service is temporarily unavailable.") from exc
     finally:
         try:
             os.remove(samples_file)
         except OSError:
             pass
     return {"face_status": "failed", "face_detail": "no_face", "liveness_status": "failed", "t_liveness": 0.0, "t_face": 0.0}
+
+
+def diagnose_recording(video_path: Path) -> dict:
+    """Diagnose video recording reception, decoding, and face detection without matching against enrollment."""
+    video_received = video_path.exists() and video_path.stat().st_size > 0
+    if not video_received:
+        return {
+            "video_received": False,
+            "video_decoded": False,
+            "decoder_used": "none",
+            "frames_decoded": 0,
+            "frames_checked": 0,
+            "faces_detected": 0,
+            "face_model_loaded": False,
+            "liveness_model_loaded": False,
+            "voice_model_loaded": False,
+        }
+
+    diag = verification_diagnostics()
+    face_model_loaded = diag.get("face", False)
+    liveness_model_loaded = diag.get("liveness", False)
+    voice_model_loaded = diag.get("speech", False)
+
+    decoder_used = "none"
+    raw_frames = []
+    try:
+        raw_frames = _frames_from_av(video_path)
+        decoder_used = "av"
+    except Exception as av_err:
+        logger.debug("Diagnose PyAV decode failed: %s", av_err)
+        try:
+            import cv2
+            raw_frames = _frames_from_cv2(video_path, cv2)
+            decoder_used = "cv2"
+        except Exception as cv_err:
+            logger.debug("Diagnose OpenCV decode failed: %s", cv_err)
+
+    video_decoded = len(raw_frames) >= 2
+    frames_decoded = len(raw_frames)
+    frames_checked = 0
+    faces_detected = 0
+
+    if video_decoded:
+        try:
+            import cv2
+            from deepface import DeepFace
+            shrunk_frames = [_shrink_frame(f, cv2) for f in raw_frames]
+            frames_checked = len(shrunk_frames)
+            for frame in shrunk_frames:
+                detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=False)
+                if detected:
+                    faces_detected += 1
+        except Exception as exc:
+            logger.warning("Diagnose face extraction error: %s", exc)
+
+    return {
+        "video_received": True,
+        "video_decoded": video_decoded,
+        "decoder_used": decoder_used,
+        "frames_decoded": frames_decoded,
+        "frames_checked": frames_checked,
+        "faces_detected": faces_detected,
+        "face_model_loaded": face_model_loaded,
+        "liveness_model_loaded": liveness_model_loaded,
+        "voice_model_loaded": voice_model_loaded,
+    }
 
 
 def verify_recording(

@@ -2857,7 +2857,7 @@ function Checkin({ token, onComplete, onNavigate }) {
     }
     try {
       const mimeType = typeof MediaRecorder.isTypeSupported === 'function'
-        ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4']
+        ? ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4']
             .find((type) => MediaRecorder.isTypeSupported(type))
         : undefined
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)

@@ -43,6 +43,7 @@ from pydantic import BaseModel, EmailStr, Field, StrictInt
 from resend.exceptions import ResendError
 from verification import (
     VerificationUnavailable,
+    diagnose_recording,
     preload_verification_models,
     providers_available,
     verification_diagnostics,
@@ -3679,6 +3680,27 @@ def delete_nominee(user: dict = Depends(current_user)) -> None:
             audit(connection, user["id"], "nominee.removed")
 
 
+@app.post("/api/check-ins/diagnose")
+def diagnose_checkin(
+    recording: UploadFile = File(...),
+    user: dict = Depends(current_user),
+):
+    suffix = Path(recording.filename or "").suffix.lower()
+    if suffix not in {".webm", ".mp4", ".mov"}:
+        raise HTTPException(status_code=415, detail="Upload a WebM, MP4, or MOV clip.")
+    data = recording.file.read(MAX_CHECKIN_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="The recording is empty.")
+    if len(data) > MAX_CHECKIN_BYTES:
+        raise HTTPException(status_code=413, detail="Recordings must be 20 MB or smaller.")
+
+    with tempfile.TemporaryDirectory(prefix="cloudguard-diag-") as directory:
+        video_path = Path(directory) / f"recording{suffix}"
+        video_path.write_bytes(data)
+        result = diagnose_recording(video_path)
+    return result
+
+
 @app.post("/api/check-ins", status_code=201)
 def create_checkin(
     sentence: str = Form(..., min_length=5, max_length=250),
@@ -3798,7 +3820,7 @@ def create_checkin(
         if face_detail == "different_person":
             message = "Face verification failed: this person does not match the enrolled face."
         elif face_detail == "no_face":
-            message = "Face verification failed: no usable face was found in the check-in recording."
+            message = "No usable face was detected in the check-in recording. Please face the camera directly and ensure your face is well lit."
         else:
             message = "Face verification did not pass."
     elif not passed and statuses.get("liveness_status") != "passed":

@@ -20,4 +20,10 @@ deepface>=0.0.90
 tf-keras>=2.16.0
 tensorflow-cpu>=2.16.0
 faster-whisper>=1.0.0
+werkzeug>=3.0.0
+flask>=3.0.0
+pandas>=2.0.0
+gdown>=5.0.0
+fire>=0.5.0
+gunicorn>=21.0.0
 

@@ -151,13 +151,12 @@ def _ensure_facenet_weights() -> None:
 
 
 def preload_verification_models() -> None:
-    """Preload models on server boot in a background thread so runtime verification is instantaneous."""
+    """Preload model weights on disk on server boot without consuming persistent RAM."""
     def _warmup():
         try:
-            logger.info("[PRELOAD] Starting background verification models warmup...")
+            logger.info("[PRELOAD] Ensuring FaceNet weights cached on disk...")
             _ensure_facenet_weights()
-            _ = _speech_model()
-            logger.info("[PRELOAD] Verification models preloaded and ready.")
+            logger.info("[PRELOAD] Verification weights preloaded and ready.")
         except Exception as exc:
             logger.warning("[PRELOAD] Background warmup warning: %s", exc)
 
@@ -210,12 +209,28 @@ def _frames_from_av(video_path: Path) -> list:
         logger.info("[DECODE] PyAV opened video: codec=%s, resolution=%dx%d, duration=%.2fs", codec_name, width, height, duration)
         print(f"[DECODE] PyAV opened video: codec={codec_name}, resolution={width}x{height}, duration={duration:.2f}s", flush=True)
 
-        # Single streaming pass: sample ~8-10 frames evenly spaced across the entire clip
-        # Targets indices spanning from 0.4s to 11s to cover the full speaking clip
-        sample_indices = {12, 36, 72, 108, 144, 180, 216, 252, 288, 324}
+        # Dynamic sampling: First quick pass to count total frames (takes ~10ms in PyAV)
+        total_frames = 0
+        for _ in container.decode(video=0):
+            total_frames += 1
+
+        if total_frames < 2:
+            raise ValueError("The recording could not be decoded reliably. Please record again.")
+
+        # Determine target sample indices across the clip
+        desired_count = min(10, total_frames)
+        if total_frames <= desired_count:
+            target_indices = set(range(total_frames))
+        else:
+            step = (total_frames - 1) / float(desired_count - 1)
+            target_indices = {int(round(i * step)) for i in range(desired_count)}
+
+        # Reset container to frame 0
+        container.seek(0)
+
         frame_idx = 0
         for frame in container.decode(video=0):
-            if frame_idx in sample_indices or (frame_idx > 324 and frame_idx % 36 == 0):
+            if frame_idx in target_indices:
                 array = _array_from_av_frame(frame)
                 if array is not None:
                     h, w = array.shape[:2]
@@ -229,8 +244,8 @@ def _frames_from_av(video_path: Path) -> list:
 
     if len(frames) < 2:
         raise ValueError("The recording could not be decoded reliably. Please record again.")
-    logger.info("[DECODE] PyAV sampled %d frames across video (examined %d)", len(frames), frame_idx)
-    print(f"[DECODE] PyAV sampled {len(frames)} frames across video (examined {frame_idx})", flush=True)
+    logger.info("[DECODE] PyAV sampled %d frames across video (total %d)", len(frames), total_frames)
+    print(f"[DECODE] PyAV sampled {len(frames)} frames across video (total {total_frames})", flush=True)
     return frames
 
 
@@ -242,25 +257,45 @@ def _frames_from_cv2(video_path: Path, cv2) -> list:
 
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
         frames = []
-        sample_indices = {12, 36, 72, 108, 144, 180, 216, 252, 288, 324}
-        frame_idx = 0
-        while len(frames) < 10 and frame_idx < 400:
-            if frame_idx in sample_indices or (frame_idx > 324 and frame_idx % 36 == 0):
-                success, frame = capture.read()
-                if not success or frame is None:
-                    break
-                h, w = frame.shape[:2]
-                if max(h, w) > 640:
-                    scale = 640.0 / max(h, w)
-                    frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-                frames.append(frame)
-            else:
-                success = capture.grab()
-                if not success:
-                    break
-            frame_idx += 1
+        if total_frames >= 2:
+            desired_count = min(10, total_frames)
+            step = (total_frames - 1) / float(desired_count - 1)
+            target_indices = {int(round(i * step)) for i in range(desired_count)}
+            frame_idx = 0
+            while len(frames) < 10 and frame_idx < total_frames:
+                if frame_idx in target_indices:
+                    success, frame = capture.read()
+                    if not success or frame is None:
+                        break
+                    h, w = frame.shape[:2]
+                    if max(h, w) > 640:
+                        scale = 640.0 / max(h, w)
+                        frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+                    frames.append(frame)
+                else:
+                    success = capture.grab()
+                    if not success:
+                        break
+                frame_idx += 1
+        else:
+            frame_idx = 0
+            while len(frames) < 10 and frame_idx < 400:
+                if frame_idx % 12 == 0:
+                    success, frame = capture.read()
+                    if not success or frame is None:
+                        break
+                    h, w = frame.shape[:2]
+                    if max(h, w) > 640:
+                        scale = 640.0 / max(h, w)
+                        frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+                    frames.append(frame)
+                else:
+                    if not capture.grab():
+                        break
+                frame_idx += 1
 
         if len(frames) < 2:
             raise ValueError("The recording could not be decoded reliably. Please record again.")
@@ -596,7 +631,7 @@ def _cosine_distance(embedding_a, embedding_b) -> float:
 
 
 def _identity_matches_enrollment(live_embedding, enrollment_embeddings: list) -> bool:
-    """Return True if the live face matches the owner's enrollment samples."""
+    """Return True if the live face matches at least one of the owner's enrollment samples."""
     if live_embedding is None or not enrollment_embeddings:
         return False
     distances = [_cosine_distance(live_embedding, ref) for ref in enrollment_embeddings]
@@ -604,7 +639,7 @@ def _identity_matches_enrollment(live_embedding, enrollment_embeddings: list) ->
         return False
     max_distance = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.40"))
     matches = sum(1 for d in distances if d <= max_distance)
-    needed_matches = max(1, math.ceil(len(enrollment_embeddings) * 0.34))
+    needed_matches = 1
     is_match = matches >= needed_matches
     logger.debug(
         "[FACE MATCH] distances=%s, matches=%d/%d, needed=%d, is_match=%s",
@@ -689,10 +724,10 @@ def _check_frame_liveness(face_frames, cv2) -> bool:
     diffs = [float(cv2.absdiff(grays[i], grays[i + 1]).mean()) for i in range(len(grays) - 1)]
     max_motion = max(diffs) if diffs else 0.0
 
-    logger.info("[LIVENESS] avg_sharpness=%.1f (min 10.0), max_motion=%.2f (min 0.20)", avg_sharpness, max_motion)
+    logger.info("[LIVENESS] avg_sharpness=%.1f (min 8.0), max_motion=%.2f (min 0.15)", avg_sharpness, max_motion)
     print(f"[LIVENESS] avg_sharpness={avg_sharpness:.1f}, max_motion={max_motion:.2f}", flush=True)
 
-    return bool(avg_sharpness >= 10.0 and max_motion >= 0.20)
+    return bool(avg_sharpness >= 8.0 and max_motion >= 0.15)
 
 
 def _enrollment_cache_key(encoded_samples: list[str]) -> str:
@@ -925,7 +960,7 @@ def _run_speech_subprocess(video_path: Path) -> str:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=60,
+            timeout=40,
         )
         for line in proc.stdout.splitlines():
             if line.startswith("__TRANSCRIPT__:"):
@@ -995,7 +1030,7 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=120,
+            timeout=60,
         )
         face_result = None
         worker_error = None

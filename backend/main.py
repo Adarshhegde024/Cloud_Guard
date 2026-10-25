@@ -96,6 +96,22 @@ async def lifespan(_: FastAPI):
             raise RuntimeError("CLOUDGUARD_REVIEWER_PASSWORD_HASH must be a bcrypt hash.") from error
     try:
         init_database()
+        with db() as conn:
+            fail_res = json.dumps({
+                "success": False,
+                "passed": False,
+                "status": "failed",
+                "checkin_saved": False,
+                "message": "Verification was interrupted by a server restart. Please try again.",
+                "failure_reason": "Verification was interrupted by a server restart. Please try again.",
+                "checks": {"face": "failed", "liveness": "failed", "voice": "failed"},
+            })
+            conn.execute(
+                """UPDATE checkin_jobs 
+                   SET status='failed', result_json=?, error_message='Server restart interrupted verification', updated_at=?
+                   WHERE status='processing'""",
+                (fail_res, utc_now().isoformat()),
+            )
     except Exception as error:
         logger.warning(f"Initial DB check warning: {error}")
     scheduler_task = asyncio.create_task(run_background_scheduler())
@@ -4191,13 +4207,52 @@ def get_checkin_job_status(job_id: str, user: dict = Depends(current_user)):
         try:
             with db() as connection:
                 db_row = connection.execute(
-                    "SELECT status, result_json, error_message FROM checkin_jobs WHERE id=? AND owner_id=?",
+                    "SELECT status, result_json, error_message, created_at FROM checkin_jobs WHERE id=? AND owner_id=?",
                     (job_id, user["id"]),
                 ).fetchone()
             if db_row:
                 job_status = db_row["status"]
                 result = json.loads(db_row["result_json"]) if db_row["result_json"] else None
                 error_msg = db_row["error_message"]
+                created_str = db_row["created_at"]
+
+                # Stale/dead job detection: if in DB as processing but either:
+                # 1) Not currently in this process's active in-memory tracker (server restarted), OR
+                # 2) More than 75s elapsed since job creation (subprocess terminated or died)
+                is_stale = False
+                if job_status == "processing":
+                    if mem_job is None:
+                        is_stale = True
+                    else:
+                        try:
+                            created_dt = safe_fromisoformat(created_str)
+                            if (utc_now() - created_dt).total_seconds() > 75:
+                                is_stale = True
+                        except Exception:
+                            pass
+
+                if is_stale:
+                    logger.warning("[CHECKIN STATUS] Marking dead/stale job %s as failed (created %s)", job_id, created_str)
+                    job_status = "failed"
+                    error_msg = "Verification was interrupted or timed out. Please try your check-in again."
+                    result = {
+                        "success": False,
+                        "passed": False,
+                        "status": "failed",
+                        "checkin_saved": False,
+                        "message": error_msg,
+                        "failure_reason": error_msg,
+                        "checks": {"face": "failed", "liveness": "failed", "voice": "failed"},
+                    }
+                    try:
+                        with db() as conn2:
+                            conn2.execute(
+                                "UPDATE checkin_jobs SET status='failed', result_json=?, error_message=?, updated_at=? WHERE id=?",
+                                (json.dumps(result), error_msg, utc_now().isoformat(), job_id),
+                            )
+                    except Exception as e:
+                        logger.debug("checkin_jobs db update note: %s", e)
+
                 with _CHECKIN_JOBS_LOCK:
                     _CHECKIN_JOBS[job_id] = {
                         "job_id": job_id,

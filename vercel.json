@@ -1,6 +1,10 @@
 {
   "rewrites": [
     {
+      "source": "/api",
+      "destination": "https://cloudguard-api-oknn.onrender.com/api"
+    },
+    {
       "source": "/api/(.*)",
       "destination": "https://cloudguard-api-oknn.onrender.com/api/$1"
     }

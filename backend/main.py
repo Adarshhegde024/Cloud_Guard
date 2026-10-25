@@ -1641,6 +1641,8 @@ def current_user(
 
 @app.get("/")
 @app.head("/")
+@app.get("/api")
+@app.get("/api/")
 def root_status():
     return {
         "status": "ok",
@@ -1651,11 +1653,16 @@ def root_status():
         "health": "/api/health",
     }
 
+
+@app.get("/health")
 @app.get("/api/health")
 def health() -> dict:
     configured = providers_available()
     return {
         "status": "ok",
+        "service": "CloudGuard Vault API",
+        "version": "1.0.0",
+        "database": "postgresql",
         "verification_mode": "local" if configured else "unavailable",
         "ai_verification_configured": configured,
     }

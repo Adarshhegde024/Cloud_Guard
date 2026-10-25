@@ -2,7 +2,37 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import HomePage from './HomePage.jsx'
 import { supabase } from './supabase.js'
 
-const API_URL = (import.meta.env.VITE_API_URL || '/api').replace(/\/+$/, '')
+function resolveApiUrl() {
+  const envUrl = (import.meta.env.VITE_API_URL || '').trim()
+
+  if (typeof window !== 'undefined') {
+    const hostname = window.location.hostname
+    const isLocalhost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]'
+
+    // In production (Vercel deployment or any non-localhost custom domain):
+    if (!isLocalhost) {
+      // Always route through Vercel's relative /api rewrite,
+      // ignoring any stale/obsolete external Render or dev URLs (e.g. 'eknm', 'localhost')
+      if (!envUrl || envUrl.startsWith('/api') || envUrl.includes('eknm') || envUrl.includes('localhost') || envUrl.includes('127.0.0.1')) {
+        return '/api'
+      }
+      return envUrl.replace(/\/+$/, '')
+    }
+
+    // In local development:
+    if (envUrl && !envUrl.includes('eknm')) {
+      return envUrl.replace(/\/+$/, '')
+    }
+    return '/api'
+  }
+
+  if (envUrl && !envUrl.includes('eknm') && !envUrl.includes('localhost')) {
+    return envUrl.replace(/\/+$/, '')
+  }
+  return '/api'
+}
+
+const API_URL = resolveApiUrl()
 const NAV_ITEMS = [
   { id: 'dashboard', label: 'Overview', icon: 'grid' },
   { id: 'documents', label: 'My documents', icon: 'file' },
@@ -65,7 +95,12 @@ async function api(path, { token, timeoutMs, ...options } = {}) {
       throw new Error('Verification timed out. Please try again; the first check-in can take about a minute while models load.')
     }
     if (error instanceof TypeError) {
-      throw new Error('CloudGuard API is not reachable. From the project folder, run `npm run dev` to start both the website and API, then retry.')
+      const isLocalhost = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+      if (isLocalhost) {
+        throw new Error('CloudGuard API is not reachable. From the project folder, run `npm run dev` to start both the website and API, then retry.')
+      } else {
+        throw new Error('CloudGuard API service is temporarily unreachable. Please check your internet connection or try again shortly.')
+      }
     }
     throw error
   }
@@ -1131,6 +1166,22 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
   useEffect(() => {
     if (initialMode) setMode(initialMode)
   }, [initialMode])
+
+  useEffect(() => {
+    let active = true
+    api('/health')
+      .then((health) => {
+        if (!active) return
+        if (health && (health.status === 'ok' || health.service)) {
+          setError((prev) => (prev && prev.toLowerCase().includes('unreachable') ? '' : prev))
+        }
+      })
+      .catch((err) => {
+        if (!active) return
+        console.warn('Initial API health probe:', err)
+      })
+    return () => { active = false }
+  }, [mode])
   const [showPassword, setShowPassword] = useState(false)
   const [showConfirm, setShowConfirm] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -1593,6 +1644,21 @@ function App() {
   }, [guestToken, recipientToken, nomineeToken, reviewerToken, invitationToken])
 
   useEffect(() => { load() }, [load])
+
+  useEffect(() => {
+    let active = true
+    api('/health')
+      .then((health) => {
+        if (!active) return
+        if (health && (health.status === 'ok' || health.service)) {
+          // Healthy connectivity verified
+        }
+      })
+      .catch((err) => {
+        console.warn('Initial API health check:', err)
+      })
+    return () => { active = false }
+  }, [])
 
   useEffect(() => {
     // 1. Check for OAuth errors (user cancelled or provider error)

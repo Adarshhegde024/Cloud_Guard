@@ -4218,7 +4218,7 @@ def get_checkin_job_status(job_id: str, user: dict = Depends(current_user)):
 
                 # Stale/dead job detection: if in DB as processing but either:
                 # 1) Not currently in this process's active in-memory tracker (server restarted), OR
-                # 2) More than 75s elapsed since job creation (subprocess terminated or died)
+                # 2) More than 150s elapsed since job creation (subprocess terminated or died)
                 is_stale = False
                 if job_status == "processing":
                     if mem_job is None:
@@ -4226,7 +4226,7 @@ def get_checkin_job_status(job_id: str, user: dict = Depends(current_user)):
                     else:
                         try:
                             created_dt = safe_fromisoformat(created_str)
-                            if (utc_now() - created_dt).total_seconds() > 75:
+                            if (utc_now() - created_dt).total_seconds() > 150:
                                 is_stale = True
                         except Exception:
                             pass

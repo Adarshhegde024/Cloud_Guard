@@ -689,7 +689,7 @@ def _enrollment_embeddings(DeepFace, cv2, enrollment_images: list) -> list:
     """Extract embeddings from enrollment images using the unified crop pipeline."""
     embeddings = []
     for ref_img in enrollment_images:
-        if len(embeddings) >= 3:
+        if len(embeddings) >= 2:
             break
         if ref_img is None or getattr(ref_img, "size", 0) == 0:
             continue
@@ -875,13 +875,13 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
         if enrollment_vectors:
             _save_cached_enrollment_embeddings(cache_key, enrollment_vectors)
 
-    # Select up to 3 representative, evenly-spaced face crops across the recording
+    # Select up to 2 representative, evenly-spaced face crops across the recording
     # to avoid redundant CPU inference loops while maintaining high identity verification accuracy.
-    if len(face_crops) <= 3:
+    if len(face_crops) <= 2:
         selected_crops = face_crops
     else:
-        step = len(face_crops) / 3.0
-        indices = [int(i * step) for i in range(3)]
+        step = len(face_crops) / 2.0
+        indices = [int(i * step) for i in range(2)]
         selected_crops = [face_crops[min(idx, len(face_crops) - 1)] for idx in indices]
 
     # Target threshold for early confirmation: 1 confirmed match with cosine distance <= 0.40
@@ -1030,7 +1030,7 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=60,
+            timeout=110,
         )
         face_result = None
         worker_error = None

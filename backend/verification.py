@@ -349,6 +349,9 @@ def _usable_detected_face(detected, frame):
 
 def _safe_extract_faces(DeepFace, frame, anti_spoofing: bool):
     """Call DeepFace.extract_faces and swallow non-critical errors."""
+    image_shape = getattr(frame, "shape", None)
+    if image_shape is None or len(image_shape) < 2 or image_shape[0] < MIN_FACE_PX or image_shape[1] < MIN_FACE_PX:
+        return []
     for detector in FACE_DETECTORS:
         try:
             detected = DeepFace.extract_faces(
@@ -363,6 +366,8 @@ def _safe_extract_faces(DeepFace, frame, anti_spoofing: bool):
         usable = _usable_detected_face(detected, frame)
         if usable is not None:
             return [usable]
+        if not detected and not anti_spoofing:
+            break
     return []
 
 
@@ -430,6 +435,8 @@ def _decide_face_outcome(identity_votes: int, frames_attempted: int) -> tuple[st
 def _embedding_from_array(DeepFace, image):
     """Return a single-face embedding, or None if no unambiguous face is found."""
     image_shape = getattr(image, "shape", None)
+    if image_shape is None or len(image_shape) < 2 or image_shape[0] < MIN_FACE_PX or image_shape[1] < MIN_FACE_PX:
+        return None
     last_error = None
     for detector in FACE_DETECTORS:
         try:
@@ -452,6 +459,8 @@ def _embedding_from_array(DeepFace, image):
         embedding = item.get("embedding")
         if embedding:
             return embedding
+        if not representations:
+            break
     if last_error:
         logger.debug("No usable face embedding: %s", last_error)
     return None
@@ -574,7 +583,7 @@ def _run_speech_subprocess(video_path: Path) -> str:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=50,
+            timeout=25,
         )
         for line in proc.stdout.splitlines():
             if line.startswith("__TRANSCRIPT__:"):
@@ -628,7 +637,7 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=85,
+            timeout=45,
         )
         for line in proc.stdout.splitlines():
             if line.startswith("__FACE_RESULT__:"):

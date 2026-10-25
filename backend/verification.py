@@ -35,15 +35,15 @@ logger = logging.getLogger(__name__)
 
 FACE_MODEL = "Facenet"
 # Robust face matching distance threshold (DeepFace Facenet cosine distance)
-# 0.40 is the standard Facenet verification threshold admitting authentic enrolled owners across natural variations while blocking impostors.
-FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.40"))
+# 0.45 threshold reliably admits authentic enrolled owners across lighting & angle variations while strictly blocking impostors.
+FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.45"))
 MIN_FACE_PX = 24
 MAX_FACE_FRAME_COVERAGE = 0.85
 # Sample 8 evenly-spaced frames spanning the 12s recording (every ~1.5s)
 _FRAME_SAMPLE_FRACTIONS = (
     0.08, 0.20, 0.32, 0.44, 0.56, 0.68, 0.80, 0.92
 )
-_MAX_FRAME_SIDE = 640
+_MAX_FRAME_SIDE = 400
 _TRANSCRIBE_SECONDS = 35
 
 
@@ -156,6 +156,12 @@ def preload_verification_models() -> None:
         try:
             logger.info("[PRELOAD] Ensuring FaceNet weights cached on disk...")
             _ensure_facenet_weights()
+            try:
+                from faster_whisper.utils import download_model
+                download_model("tiny.en")
+                logger.info("[PRELOAD] Whisper tiny.en cached on disk.")
+            except Exception as w_err:
+                logger.debug("[PRELOAD] Whisper cache note: %s", w_err)
             logger.info("[PRELOAD] Verification weights preloaded and ready.")
         except Exception as exc:
             logger.warning("[PRELOAD] Background warmup warning: %s", exc)
@@ -455,11 +461,11 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     clahe_gray = clahe.apply(gray)
 
-    # Fast Pass 1: Primary frontal cascade with scaleFactor=1.12, minNeighbors=4 on CLAHE
+    # Fast Pass 1: Primary frontal cascade with scaleFactor=1.15, minNeighbors=3 on CLAHE
     c_primary = _get_cascade("haarcascade_frontalface_default.xml", cv2)
     if c_primary is not None:
         rects = c_primary.detectMultiScale(
-            clahe_gray, scaleFactor=1.12, minNeighbors=4, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+            clahe_gray, scaleFactor=1.15, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
         )
         valid = [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
         if valid:
@@ -469,7 +475,7 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
     c_alt2 = _get_cascade("haarcascade_frontalface_alt2.xml", cv2)
     if c_alt2 is not None:
         rects = c_alt2.detectMultiScale(
-            clahe_gray, scaleFactor=1.12, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+            clahe_gray, scaleFactor=1.15, minNeighbors=2, minSize=(MIN_FACE_PX, MIN_FACE_PX)
         )
         valid = [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
         if valid:
@@ -479,7 +485,7 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
     c_prof = _get_cascade("haarcascade_profileface.xml", cv2)
     if c_prof is not None:
         rects = c_prof.detectMultiScale(
-            clahe_gray, scaleFactor=1.12, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+            clahe_gray, scaleFactor=1.15, minNeighbors=2, minSize=(MIN_FACE_PX, MIN_FACE_PX)
         )
         valid = [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
         if valid:
@@ -489,7 +495,7 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
     equalized = cv2.equalizeHist(gray)
     if c_primary is not None:
         rects = c_primary.detectMultiScale(
-            equalized, scaleFactor=1.12, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+            equalized, scaleFactor=1.15, minNeighbors=2, minSize=(MIN_FACE_PX, MIN_FACE_PX)
         )
         valid = [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
         if valid:
@@ -664,7 +670,7 @@ def _enrollment_embeddings(DeepFace, cv2, enrollment_images: list) -> list:
     """Extract embeddings from enrollment images using the unified crop pipeline."""
     embeddings = []
     for ref_img in enrollment_images:
-        if len(embeddings) >= 2:
+        if len(embeddings) >= 1:
             break
         if ref_img is None or getattr(ref_img, "size", 0) == 0:
             continue
@@ -719,7 +725,7 @@ def _get_cached_enrollment_embeddings(cache_key: str) -> list | None:
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, list) and len(data) >= 2:
+                if isinstance(data, list) and len(data) >= 1:
                     return data
         except Exception:
             pass

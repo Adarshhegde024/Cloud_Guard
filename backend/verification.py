@@ -209,43 +209,30 @@ def _frames_from_av(video_path: Path) -> list:
         logger.info("[DECODE] PyAV opened video: codec=%s, resolution=%dx%d, duration=%.2fs", codec_name, width, height, duration)
         print(f"[DECODE] PyAV opened video: codec={codec_name}, resolution={width}x{height}, duration={duration:.2f}s", flush=True)
 
-        # Dynamic sampling: First quick pass to count total frames (takes ~10ms in PyAV)
-        total_frames = 0
-        for _ in container.decode(video=0):
-            total_frames += 1
+        # Dynamic single-pass sampling: decode frames once, resizing to <= 480px to protect memory
+        raw_frames = []
+        for frame in container.decode(video=0):
+            array = _array_from_av_frame(frame)
+            if array is not None:
+                h, w = array.shape[:2]
+                if max(h, w) > 480:
+                    scale = 480.0 / max(h, w)
+                    array = cv2.resize(array, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+                raw_frames.append(array)
+                if len(raw_frames) >= 120:  # Cap at 120 frames (~12s at 10fps)
+                    break
 
-        if total_frames < 2:
+        if len(raw_frames) < 2:
             raise ValueError("The recording could not be decoded reliably. Please record again.")
 
-        # Determine target sample indices across the clip
-        desired_count = min(10, total_frames)
-        if total_frames <= desired_count:
-            target_indices = set(range(total_frames))
+        if len(raw_frames) <= 10:
+            frames = raw_frames
         else:
-            step = (total_frames - 1) / float(desired_count - 1)
-            target_indices = {int(round(i * step)) for i in range(desired_count)}
+            step = (len(raw_frames) - 1) / 9.0
+            frames = [raw_frames[int(round(i * step))] for i in range(10)]
 
-        # Reset container to frame 0
-        container.seek(0)
-
-        frame_idx = 0
-        for frame in container.decode(video=0):
-            if frame_idx in target_indices:
-                array = _array_from_av_frame(frame)
-                if array is not None:
-                    h, w = array.shape[:2]
-                    if max(h, w) > 640:
-                        scale = 640.0 / max(h, w)
-                        array = cv2.resize(array, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-                    frames.append(array)
-                    if len(frames) >= 10:
-                        break
-            frame_idx += 1
-
-    if len(frames) < 2:
-        raise ValueError("The recording could not be decoded reliably. Please record again.")
-    logger.info("[DECODE] PyAV sampled %d frames across video (total %d)", len(frames), total_frames)
-    print(f"[DECODE] PyAV sampled {len(frames)} frames across video (total {total_frames})", flush=True)
+    logger.info("[DECODE] PyAV sampled %d frames across video (total decoded %d)", len(frames), len(raw_frames))
+    print(f"[DECODE] PyAV sampled {len(frames)} frames across video (total decoded {len(raw_frames)})", flush=True)
     return frames
 
 
@@ -259,48 +246,28 @@ def _frames_from_cv2(video_path: Path, cv2) -> list:
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-        frames = []
-        if total_frames >= 2:
-            desired_count = min(10, total_frames)
-            step = (total_frames - 1) / float(desired_count - 1)
-            target_indices = {int(round(i * step)) for i in range(desired_count)}
-            frame_idx = 0
-            while len(frames) < 10 and frame_idx < total_frames:
-                if frame_idx in target_indices:
-                    success, frame = capture.read()
-                    if not success or frame is None:
-                        break
-                    h, w = frame.shape[:2]
-                    if max(h, w) > 640:
-                        scale = 640.0 / max(h, w)
-                        frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-                    frames.append(frame)
-                else:
-                    success = capture.grab()
-                    if not success:
-                        break
-                frame_idx += 1
-        else:
-            frame_idx = 0
-            while len(frames) < 10 and frame_idx < 400:
-                if frame_idx % 12 == 0:
-                    success, frame = capture.read()
-                    if not success or frame is None:
-                        break
-                    h, w = frame.shape[:2]
-                    if max(h, w) > 640:
-                        scale = 640.0 / max(h, w)
-                        frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-                    frames.append(frame)
-                else:
-                    if not capture.grab():
-                        break
-                frame_idx += 1
+        raw_frames = []
+        while len(raw_frames) < 120:
+            success, frame = capture.read()
+            if not success or frame is None:
+                break
+            h, w = frame.shape[:2]
+            if max(h, w) > 480:
+                scale = 480.0 / max(h, w)
+                frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+            raw_frames.append(frame)
 
-        if len(frames) < 2:
+        if len(raw_frames) < 2:
             raise ValueError("The recording could not be decoded reliably. Please record again.")
-        logger.info("[DECODE] OpenCV sampled %d frames (total examined: %d, %dx%d)", len(frames), frame_idx, width, height)
-        print(f"[DECODE] OpenCV sampled {len(frames)} frames (total examined: {frame_idx}, {width}x{height})", flush=True)
+
+        if len(raw_frames) <= 10:
+            frames = raw_frames
+        else:
+            step = (len(raw_frames) - 1) / 9.0
+            frames = [raw_frames[int(round(i * step))] for i in range(10)]
+
+        logger.info("[DECODE] OpenCV sampled %d frames (total decoded: %d, %dx%d)", len(frames), len(raw_frames), width, height)
+        print(f"[DECODE] OpenCV sampled {len(frames)} frames (total decoded: {len(raw_frames)}, {width}x{height})", flush=True)
         return frames
     finally:
         capture.release()
@@ -568,6 +535,7 @@ def _embedding_from_crop(DeepFace, face_crop):
     """
     Generate FaceNet embedding directly from pre-detected, cropped face image.
     Uses detector_backend='skip' so no redundant or failing internal detector is invoked.
+    Directly standardizes to 160x160 to eliminate GPU/CPU in-graph resizing and conserve RAM.
     """
     if face_crop is None or getattr(face_crop, "size", 0) == 0:
         return None
@@ -575,8 +543,15 @@ def _embedding_from_crop(DeepFace, face_crop):
     if H < MIN_FACE_PX or W < MIN_FACE_PX:
         return None
     try:
+        import cv2
+        import numpy as np
+        if face_crop.shape[0] != 160 or face_crop.shape[1] != 160:
+            crop_input = cv2.resize(face_crop, (160, 160), interpolation=cv2.INTER_AREA)
+        else:
+            crop_input = face_crop
+        crop_input = np.ascontiguousarray(crop_input)
         reps = DeepFace.represent(
-            img_path=face_crop,
+            img_path=crop_input,
             model_name=FACE_MODEL,
             detector_backend="skip",
             enforce_detection=False,
@@ -637,7 +612,7 @@ def _identity_matches_enrollment(live_embedding, enrollment_embeddings: list) ->
     distances = [_cosine_distance(live_embedding, ref) for ref in enrollment_embeddings]
     if not distances:
         return False
-    max_distance = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.40"))
+    max_distance = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.45"))
     matches = sum(1 for d in distances if d <= max_distance)
     needed_matches = 1
     is_match = matches >= needed_matches
@@ -934,9 +909,14 @@ def _run_speech_subprocess(video_path: Path) -> str:
     root_dir = str(Path(__file__).resolve().parent.parent).replace("\\", "/")
     script = (
         "import sys, os\n"
+        "if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8')\n"
+        "if hasattr(sys.stderr, 'reconfigure'): sys.stderr.reconfigure(encoding='utf-8')\n"
         "os.environ['PYTHONIOENCODING'] = 'utf-8'\n"
         "os.environ['PYTHONUTF8'] = '1'\n"
         "os.environ['OMP_NUM_THREADS'] = '1'\n"
+        "os.environ['OPENBLAS_NUM_THREADS'] = '1'\n"
+        "os.environ['MKL_NUM_THREADS'] = '1'\n"
+        "os.environ['MALLOC_ARENA_MAX'] = '2'\n"
         f"for d in ('{file_dir}', '{root_dir}'):\n"
         "    if d not in sys.path: sys.path.insert(0, d)\n"
         "from pathlib import Path\n"
@@ -945,12 +925,15 @@ def _run_speech_subprocess(video_path: Path) -> str:
         "except ImportError:\n"
         "    from backend.verification import _transcribe_recording\n"
         f"t = _transcribe_recording(Path(r'{str(video_path).replace(chr(92), '/')}'))\n"
-        "print('__TRANSCRIPT__:' + (t or ''))\n"
+        "print('__TRANSCRIPT__:' + (t or ''), flush=True)\n"
     )
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env["OMP_NUM_THREADS"] = "1"
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["MALLOC_ARENA_MAX"] = "2"
     env["PYTHONPATH"] = f"{file_dir}{os.pathsep}{root_dir}"
     try:
         proc = subprocess.run(
@@ -960,7 +943,7 @@ def _run_speech_subprocess(video_path: Path) -> str:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=40,
+            timeout=60,
         )
         for line in proc.stdout.splitlines():
             if line.startswith("__TRANSCRIPT__:"):
@@ -984,17 +967,26 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
 
     deepface_home = str(Path.home()).replace("\\", "/")
     script = (
-        "import sys, os, json, traceback\n"
+        "import sys, os, json, traceback, gc\n"
+        "if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(encoding='utf-8')\n"
+        "if hasattr(sys.stderr, 'reconfigure'): sys.stderr.reconfigure(encoding='utf-8')\n"
         "os.environ['PYTHONIOENCODING'] = 'utf-8'\n"
         "os.environ['PYTHONUTF8'] = '1'\n"
         "os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'\n"
         "os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'\n"
         "os.environ['OMP_NUM_THREADS'] = '1'\n"
-        "os.environ['TF_NUM_INTRAOP_THREADS'] = '1'\n"
-        "os.environ['TF_NUM_INTEROP_THREADS'] = '1'\n"
+        "os.environ['OPENBLAS_NUM_THREADS'] = '1'\n"
+        "os.environ['MKL_NUM_THREADS'] = '1'\n"
+        "os.environ['VECLIB_MAXIMUM_THREADS'] = '1'\n"
+        "os.environ['NUMEXPR_NUM_THREADS'] = '1'\n"
+        "os.environ['MALLOC_ARENA_MAX'] = '2'\n"
+        "try:\n"
+        "    import tensorflow as tf\n"
+        "    tf.config.threading.set_inter_op_parallelism_threads(1)\n"
+        "    tf.config.threading.set_intra_op_parallelism_threads(1)\n"
+        "except Exception:\n"
+        "    pass\n"
         f"os.environ['DEEPFACE_HOME'] = r'{deepface_home}'\n"
-        "if hasattr(sys.stdout, 'reconfigure'):\n"
-        "    sys.stdout.reconfigure(encoding='utf-8')\n"
         f"for d in ('{file_dir}', '{root_dir}'):\n"
         "    if d not in sys.path: sys.path.insert(0, d)\n"
         "from pathlib import Path\n"
@@ -1006,9 +998,9 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
         f"    with open(r'{samples_file.replace(chr(92), '/')}', 'r', encoding='utf-8') as f:\n"
         "        samples = json.load(f)\n"
         f"    res = _evaluate_face_and_liveness(Path(r'{str(video_path).replace(chr(92), '/')}'), samples)\n"
-        "    print('__FACE_RESULT__:' + json.dumps(res))\n"
+        "    print('__FACE_RESULT__:' + json.dumps(res), flush=True)\n"
         "except Exception as exc:\n"
-        "    print('__FACE_ERROR__:' + str(exc))\n"
+        "    print('__FACE_ERROR__:' + str(exc), flush=True)\n"
         "    traceback.print_exc()\n"
         "    sys.exit(1)\n"
     )
@@ -1018,44 +1010,60 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
     env["TF_CPP_MIN_LOG_LEVEL"] = "3"
     env["TF_ENABLE_ONEDNN_OPTS"] = "0"
     env["OMP_NUM_THREADS"] = "1"
-    env["TF_NUM_INTRAOP_THREADS"] = "1"
-    env["TF_NUM_INTEROP_THREADS"] = "1"
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["VECLIB_MAXIMUM_THREADS"] = "1"
+    env["NUMEXPR_NUM_THREADS"] = "1"
+    env["MALLOC_ARENA_MAX"] = "2"
+    env["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
     env["DEEPFACE_HOME"] = str(Path.home())
     env["PYTHONPATH"] = f"{file_dir}{os.pathsep}{root_dir}"
+    proc = None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [sys.executable, "-c", script],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=110,
         )
         face_result = None
         worker_error = None
-        for line in proc.stdout.splitlines():
+        last_output_line = ""
+        for line in iter(proc.stdout.readline, ''):
             line_str = line.strip()
-            if line_str.startswith("[FACE]") or line_str.startswith("[MODEL]") or line_str.startswith("[CHECKIN]"):
-                logger.info(line_str)
+            if not line_str:
+                continue
+            last_output_line = line_str
+            if line_str.startswith("[FACE]") or line_str.startswith("[MODEL]") or line_str.startswith("[CHECKIN]") or line_str.startswith("[DECODE]") or line_str.startswith("[LIVENESS]"):
+                logger.info("[FACE WORKER] %s", line_str)
             elif line_str.startswith("__FACE_RESULT__:"):
                 face_result = json.loads(line_str.split("__FACE_RESULT__:", 1)[1].strip())
             elif line_str.startswith("__FACE_ERROR__:"):
                 worker_error = line_str.split("__FACE_ERROR__:", 1)[1].strip()
+        proc.stdout.close()
+        proc.wait(timeout=110)
+
         if face_result is not None:
             return face_result
-        logger.warning("Face worker failed. Output: %s (err: %s)", proc.stdout, proc.stderr)
+        logger.warning("Face worker finished without result. Last output: %s", last_output_line)
         if worker_error or proc.returncode != 0:
             raise VerificationUnavailable(
-                f"Face verification service is temporarily unavailable: {worker_error or 'process terminated'}"
+                f"Face verification service is temporarily unavailable: {worker_error or last_output_line or 'process terminated'}"
             )
     except subprocess.TimeoutExpired as exc:
-        stdout_str = exc.stdout.decode('utf-8', errors='replace') if isinstance(exc.stdout, bytes) else str(exc.stdout or '')
-        stderr_str = exc.stderr.decode('utf-8', errors='replace') if isinstance(exc.stderr, bytes) else str(exc.stderr or '')
-        last_line = stdout_str.strip().splitlines()[-1] if stdout_str.strip().splitlines() else "none"
-        logger.error("Face worker timed out: %s. Last output: %s (err: %s)", exc, last_line, stderr_str)
-        raise VerificationUnavailable(f"Face verification timed out at step: {last_line}") from exc
+        if proc:
+            proc.kill()
+        logger.error("Face worker timed out: %s. Last output: %s", exc, last_output_line)
+        raise VerificationUnavailable(f"Face verification timed out at step: {last_output_line}") from exc
     except Exception as exc:
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         logger.warning("Face worker error: %s", exc)
         if isinstance(exc, VerificationUnavailable):
             raise

@@ -3,7 +3,7 @@ import hashlib
 import json
 import os
 import secrets
-import sqlite3
+# sqlite3 removed - pure PostgreSQL
 
 os.environ.setdefault("CLOUDGUARD_JWT_SECRET", secrets.token_urlsafe(48))
 os.environ.setdefault("CLOUDGUARD_FILE_KEY", base64.b64encode(secrets.token_bytes(32)).decode())
@@ -156,7 +156,7 @@ def test_owner_documents_are_encrypted_and_isolated(tmp_path, monkeypatch):
         assert download.headers["content-disposition"] == f'attachment; filename="{document_id}.cgenc"'
         assert main.decrypt_bytes(download.content) == b"private document contents"
 
-        with sqlite3.connect(main.DATABASE) as connection:
+        with main.db() as connection:
             ciphertext = connection.execute(
                 "SELECT encrypted_data FROM documents WHERE id=?", (document_id,)
             ).fetchone()[0]
@@ -208,7 +208,7 @@ def test_document_assignments_are_saved_updated_and_revoked_on_recipient_removal
         assert next(doc for doc in listed if doc["id"] == document_id)["recipient_ids"] == [
             recipient_ids[0]
         ]
-        with sqlite3.connect(main.DATABASE) as connection:
+        with main.db() as connection:
             assert connection.execute(
                 "SELECT document_id,recipient_id FROM document_shares"
             ).fetchall() == [(document_id, recipient_ids[0])]
@@ -243,7 +243,7 @@ def test_document_assignments_are_saved_updated_and_revoked_on_recipient_removal
         assert removed.status_code == 204
         listed = client.get("/api/documents", headers=headers).json()["documents"]
         assert next(doc for doc in listed if doc["id"] == document_id)["recipient_ids"] == []
-        with sqlite3.connect(main.DATABASE) as connection:
+        with main.db() as connection:
             assert connection.execute(
                 "SELECT COUNT(*) FROM document_shares WHERE document_id=?",
                 (document_id,),
@@ -314,7 +314,7 @@ def test_document_assignments_reject_foreign_recipient_and_document_ids(
         assert next(doc for doc in listed if doc["id"] == document_id)["recipient_ids"] == [
             own_recipient
         ]
-        with sqlite3.connect(main.DATABASE) as connection:
+        with main.db() as connection:
             assert connection.execute(
                 "SELECT COUNT(*) FROM documents WHERE owner_id=(SELECT id FROM users WHERE email=?)",
                 ("owner@example.com",),
@@ -613,7 +613,7 @@ def test_invitation_requires_email_configuration_without_creating_invitation(
         assert "RESEND_API_KEY" in response.json()["detail"]
         assert "RESEND_FROM_EMAIL" in response.json()["detail"]
         assert "CLOUDGUARD_APP_URL" in response.json()["detail"]
-        with sqlite3.connect(main.DATABASE) as connection:
+        with main.db() as connection:
             assert connection.execute("SELECT COUNT(*) FROM invitations").fetchone()[0] == 0
 
 
@@ -657,7 +657,7 @@ def test_recipient_invitation_creates_single_use_restricted_account(
         assert "Authorized Recipient" in message["text"]
         assert "test-resend-key" not in json.dumps(message)
         token = message["text"].split("#guest-invitation=", 1)[1].splitlines()[0]
-        with sqlite3.connect(main.DATABASE) as connection:
+        with main.db() as connection:
             stored_hash = connection.execute(
                 "SELECT token_hash FROM invitations WHERE id=?",
                 (invited.json()["invitation"]["id"],),
@@ -805,7 +805,7 @@ def test_nominee_review_release_and_medical_hold_enforce_separate_permissions(
         assert submitted.status_code == 201, submitted.text
         case_id = submitted.json()["case"]["id"]
         assert submitted.json()["case"]["status"] == "under_review"
-        with sqlite3.connect(main.DATABASE) as connection:
+        with main.db() as connection:
             encrypted_evidence = connection.execute(
                 "SELECT evidence_ciphertext FROM death_cases WHERE id=?", (case_id,)
             ).fetchone()[0]
@@ -916,7 +916,7 @@ def test_nominee_review_release_and_medical_hold_enforce_separate_permissions(
             f"/api/recipient/documents/{document_id}/download", headers=recipient_headers
         ).status_code == 403
 
-        with sqlite3.connect(main.DATABASE) as connection:
+        with main.db() as connection:
             events = {
                 row[0]
                 for row in connection.execute("SELECT event FROM audit_logs")
@@ -1093,7 +1093,7 @@ def test_invitation_scope_role_expiry_and_contact_change_revocation(
         )
         expired_id = expired.json()["invitation"]["id"]
         expired_token = sent_messages[-1]["text"].split("#guest-invitation=", 1)[1].splitlines()[0]
-        with sqlite3.connect(main.DATABASE) as connection:
+        with main.db() as connection:
             connection.execute(
                 "UPDATE invitations SET expires_at=? WHERE id=?",
                 ((main.utc_now() - main.timedelta(days=1)).isoformat(), expired_id),

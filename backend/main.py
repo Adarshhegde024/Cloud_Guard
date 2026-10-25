@@ -7,7 +7,10 @@ import logging
 import os
 import re
 import secrets
-import sqlite3
+import psycopg2
+from psycopg2.extras import DictCursor
+from psycopg2 import errors as pg_errors
+from psycopg2 import IntegrityError as PGIntegrityError
 import tempfile
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -32,8 +35,8 @@ from verification import VerificationUnavailable, providers_available, verify_re
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 os.environ.setdefault("DEEPFACE_BACKEND_ENGINE", os.getenv("CLOUDGUARD_DEEPFACE_ENGINE", "tensorflow"))
-DATABASE = Path(os.getenv("CLOUDGUARD_DATABASE", str(BASE_DIR / "cloudguard.db")))
 DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("CLOUDGUARD_DATABASE_URL") or ""
+DATABASE = ""
 JWT_SECRET = os.getenv("CLOUDGUARD_JWT_SECRET") or os.getenv("JWT_SECRET") or "cloudguard-super-secure-production-jwt-token-key-2026-legacy-vault-99881"
 FILE_KEY_B64 = os.getenv("CLOUDGUARD_FILE_KEY") or os.getenv("FILE_KEY") or "jTeTWxu8FE9ztVf/Os1VUphADlOJPzpRZml2nWuEJxw="
 ENVIRONMENT = os.getenv("CLOUDGUARD_ENV", "development")
@@ -129,15 +132,7 @@ def safe_fromisoformat(v):
     return v
 
 
-def is_postgres() -> bool:
-    return DATABASE_URL.startswith("postgres://") or DATABASE_URL.startswith("postgresql://")
 
-try:
-    import psycopg2
-    from psycopg2.extras import DictCursor
-except ImportError:
-    psycopg2 = None
-    DictCursor = None
 
 def _normalize_pg_val(val):
     if isinstance(val, memoryview):
@@ -180,6 +175,11 @@ class PGConnection:
     @property
     def in_transaction(self):
         return True
+
+    def executescript(self, sql_script):
+        cur = self._conn.cursor(cursor_factory=DictCursor)
+        cur.execute(sql_script)
+        return PGCursorWrapper(cur)
 
     def execute(self, sql, params=None):
         clean_sql = sql.strip()
@@ -224,31 +224,24 @@ class PGConnection:
 
 @contextmanager
 def db():
-    if is_postgres():
-        if not psycopg2:
-            raise RuntimeError("psycopg2 is required for PostgreSQL connections.")
-        raw_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
-        conn = PGConnection(raw_conn)
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-    else:
-        connection = sqlite3.connect(DATABASE)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        try:
-            yield connection
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL must be configured with a valid PostgreSQL connection string. "
+            "CloudGuard operates exclusively on PostgreSQL."
+        )
+    kwargs = {"connect_timeout": 10}
+    if "sslmode=" not in DATABASE_URL and ("localhost" not in DATABASE_URL and "127.0.0.1" not in DATABASE_URL):
+        kwargs["sslmode"] = "require"
+    raw_conn = psycopg2.connect(DATABASE_URL, **kwargs)
+    conn = PGConnection(raw_conn)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def encryption_key() -> bytes:
@@ -273,10 +266,8 @@ def decrypt_bytes(data: bytes) -> bytes:
 
 
 def migrate_schema(connection) -> None:
-    if is_postgres():
-        return
-    user_cols = {row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
     user_additions = [
+        ("checkin_interval", "INTEGER NOT NULL DEFAULT 30"),
         ("checkin_frequency_value", "INTEGER NOT NULL DEFAULT 30"),
         ("checkin_frequency_unit", "TEXT NOT NULL DEFAULT 'days'"),
         ("checkin_frequency_seconds", "INTEGER NOT NULL DEFAULT 2592000"),
@@ -292,10 +283,8 @@ def migrate_schema(connection) -> None:
         ("grace_period_deadline", "TEXT"),
     ]
     for col, col_def in user_additions:
-        if col not in user_cols:
-            connection.execute(f"ALTER TABLE users ADD COLUMN {col} {col_def}")
+        connection.execute(f"ALTER TABLE public.users ADD COLUMN IF NOT EXISTS {col} {col_def}")
 
-    case_cols = {row["name"] for row in connection.execute("PRAGMA table_info(death_cases)").fetchall()}
     case_additions = [
         ("extracted_name", "TEXT NOT NULL DEFAULT ''"),
         ("extracted_dob", "TEXT NOT NULL DEFAULT ''"),
@@ -307,25 +296,20 @@ def migrate_schema(connection) -> None:
         ("discrepancies_json", "TEXT NOT NULL DEFAULT '[]'"),
     ]
     for col, col_def in case_additions:
-        if col not in case_cols:
-            connection.execute(f"ALTER TABLE death_cases ADD COLUMN {col} {col_def}")
+        connection.execute(f"ALTER TABLE public.death_cases ADD COLUMN IF NOT EXISTS {col} {col_def}")
 
 
 def init_database() -> None:
-    if is_postgres():
-        with db() as conn:
-            conn.execute("SELECT 1 FROM users LIMIT 1;")
-        return
     with db() as connection:
         connection.executescript(
             """
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS public.users (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
                 name TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                email TEXT NOT NULL UNIQUE,
                 phone TEXT NOT NULL DEFAULT '',
-                password_hash BLOB NOT NULL,
-                face_enrollment BLOB,
+                password_hash BYTEA NOT NULL,
+                face_enrollment BYTEA,
                 checkin_interval INTEGER NOT NULL DEFAULT 30,
                 checkin_frequency_value INTEGER NOT NULL DEFAULT 30,
                 checkin_frequency_unit TEXT NOT NULL DEFAULT 'days',
@@ -342,18 +326,21 @@ def init_database() -> None:
                 grace_period_deadline TEXT,
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS sessions (
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_lower ON public.users (LOWER(email));
+
+            CREATE TABLE IF NOT EXISTS public.sessions (
                 id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
                 expires_at TEXT NOT NULL,
                 revoked_at TEXT
             );
-            CREATE TABLE IF NOT EXISTS invitations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                email TEXT NOT NULL COLLATE NOCASE,
+
+            CREATE TABLE IF NOT EXISTS public.invitations (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                owner_id BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                email TEXT NOT NULL,
                 role TEXT NOT NULL CHECK(role IN ('nominee', 'recipient')),
-                target_id INTEGER NOT NULL,
+                target_id BIGINT NOT NULL,
                 token_hash TEXT NOT NULL UNIQUE,
                 status TEXT NOT NULL CHECK(status IN ('pending', 'sent', 'claimed', 'revoked', 'failed')),
                 created_at TEXT NOT NULL,
@@ -363,78 +350,99 @@ def init_database() -> None:
                 revoked_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_invitations_owner_target
-                ON invitations(owner_id, role, target_id, created_at);
-            CREATE TABLE IF NOT EXISTS guest_sessions (
+                ON public.invitations(owner_id, role, target_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS public.guest_sessions (
                 id TEXT PRIMARY KEY,
-                invitation_id INTEGER NOT NULL REFERENCES invitations(id) ON DELETE CASCADE,
+                invitation_id BIGINT NOT NULL REFERENCES public.invitations(id) ON DELETE CASCADE,
                 expires_at TEXT NOT NULL,
                 revoked_at TEXT
             );
-            CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+            CREATE TABLE IF NOT EXISTS public.documents (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                owner_id BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
                 category TEXT NOT NULL,
                 file_name TEXT NOT NULL,
                 content_type TEXT NOT NULL,
-                file_size INTEGER NOT NULL,
-                encrypted_data BLOB NOT NULL,
+                file_size BIGINT NOT NULL,
+                encrypted_data BYTEA NOT NULL,
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS recipients (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+
+            CREATE TABLE IF NOT EXISTS public.recipients (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                owner_id BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
                 email TEXT NOT NULL,
                 relationship TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS document_shares (
-                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-                recipient_id INTEGER NOT NULL REFERENCES recipients(id) ON DELETE CASCADE,
+
+            CREATE TABLE IF NOT EXISTS public.document_shares (
+                document_id BIGINT NOT NULL REFERENCES public.documents(id) ON DELETE CASCADE,
+                recipient_id BIGINT NOT NULL REFERENCES public.recipients(id) ON DELETE CASCADE,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (document_id, recipient_id)
             );
-            CREATE TABLE IF NOT EXISTS recipient_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                recipient_id INTEGER NOT NULL UNIQUE REFERENCES recipients(id) ON DELETE CASCADE,
-                password_hash BLOB NOT NULL,
+
+            CREATE TABLE IF NOT EXISTS public.recipient_accounts (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                recipient_id BIGINT NOT NULL UNIQUE REFERENCES public.recipients(id) ON DELETE CASCADE,
+                password_hash BYTEA NOT NULL,
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS recipient_sessions (
+
+            CREATE TABLE IF NOT EXISTS public.recipient_sessions (
                 id TEXT PRIMARY KEY,
-                recipient_id INTEGER NOT NULL REFERENCES recipients(id) ON DELETE CASCADE,
+                recipient_id BIGINT NOT NULL REFERENCES public.recipients(id) ON DELETE CASCADE,
                 expires_at TEXT NOT NULL,
                 revoked_at TEXT
             );
-            CREATE TABLE IF NOT EXISTS nominee_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nominee_id INTEGER NOT NULL UNIQUE REFERENCES nominees(id) ON DELETE CASCADE,
-                password_hash BLOB NOT NULL,
+
+            CREATE TABLE IF NOT EXISTS public.nominees (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                owner_id BIGINT NOT NULL UNIQUE REFERENCES public.users(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                relationship TEXT NOT NULL,
+                phone TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS public.nominee_accounts (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                nominee_id BIGINT NOT NULL UNIQUE REFERENCES public.nominees(id) ON DELETE CASCADE,
+                password_hash BYTEA NOT NULL,
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS nominee_sessions (
+
+            CREATE TABLE IF NOT EXISTS public.nominee_sessions (
                 id TEXT PRIMARY KEY,
-                nominee_id INTEGER NOT NULL REFERENCES nominees(id) ON DELETE CASCADE,
+                nominee_id BIGINT NOT NULL REFERENCES public.nominees(id) ON DELETE CASCADE,
                 expires_at TEXT NOT NULL,
                 revoked_at TEXT
             );
-            CREATE TABLE IF NOT EXISTS reviewer_sessions (
+
+            CREATE TABLE IF NOT EXISTS public.reviewer_sessions (
                 id TEXT PRIMARY KEY,
-                email TEXT NOT NULL COLLATE NOCASE,
+                email TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 revoked_at TEXT
             );
+
             CREATE TABLE IF NOT EXISTS death_cases (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                nominee_id INTEGER NOT NULL UNIQUE REFERENCES nominees(id) ON DELETE CASCADE,
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                owner_id BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                nominee_id BIGINT NOT NULL UNIQUE REFERENCES public.nominees(id) ON DELETE CASCADE,
                 status TEXT NOT NULL CHECK(status IN ('under_review','more_information_required','approved','rejected')),
                 note TEXT NOT NULL DEFAULT '',
-                evidence_ciphertext BLOB NOT NULL,
+                evidence_ciphertext BYTEA NOT NULL,
                 evidence_name TEXT NOT NULL,
                 evidence_type TEXT NOT NULL,
-                evidence_size INTEGER NOT NULL,
+                evidence_size BIGINT NOT NULL,
                 reviewer_email TEXT,
                 reviewer_message TEXT NOT NULL DEFAULT '',
                 extracted_name TEXT NOT NULL DEFAULT '',
@@ -449,52 +457,47 @@ def init_database() -> None:
                 reviewed_at TEXT,
                 updated_at TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS nominee_case_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nominee_id INTEGER NOT NULL REFERENCES nominees(id) ON DELETE CASCADE,
-                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                case_id INTEGER REFERENCES death_cases(id) ON DELETE SET NULL,
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                nominee_id BIGINT NOT NULL REFERENCES public.nominees(id) ON DELETE CASCADE,
+                owner_id BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                case_id BIGINT REFERENCES public.death_cases(id) ON DELETE SET NULL,
                 event_type TEXT NOT NULL,
                 detail TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS medical_holds (
-                owner_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                owner_id BIGINT PRIMARY KEY REFERENCES public.users(id) ON DELETE CASCADE,
                 status TEXT NOT NULL CHECK(status IN ('active','awaiting_checkin','inactive')),
                 started_at TEXT NOT NULL,
                 ended_at TEXT,
                 updated_at TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS document_releases (
-                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-                recipient_id INTEGER NOT NULL REFERENCES recipients(id) ON DELETE CASCADE,
+                document_id BIGINT NOT NULL REFERENCES public.documents(id) ON DELETE CASCADE,
+                recipient_id BIGINT NOT NULL REFERENCES public.recipients(id) ON DELETE CASCADE,
                 status TEXT NOT NULL CHECK(status IN ('available', 'revoked')),
                 released_at TEXT,
                 revoked_at TEXT,
                 PRIMARY KEY (document_id, recipient_id)
             );
+
             CREATE TABLE IF NOT EXISTS recipient_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                recipient_id INTEGER NOT NULL REFERENCES recipients(id) ON DELETE CASCADE,
-                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                recipient_id BIGINT NOT NULL REFERENCES public.recipients(id) ON DELETE CASCADE,
+                owner_id BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
                 event_type TEXT NOT NULL,
-                document_id INTEGER REFERENCES documents(id) ON DELETE SET NULL,
+                document_id BIGINT REFERENCES public.documents(id) ON DELETE SET NULL,
                 detail TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS nominees (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                email TEXT NOT NULL,
-                relationship TEXT NOT NULL,
-                phone TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
+
             CREATE TABLE IF NOT EXISTS checkins (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                owner_id BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
                 mode TEXT NOT NULL,
                 status TEXT NOT NULL,
                 face_status TEXT NOT NULL,
@@ -503,19 +506,21 @@ def init_database() -> None:
                 sentence TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                owner_id BIGINT REFERENCES public.users(id) ON DELETE SET NULL,
                 event TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 previous_hash TEXT NOT NULL,
                 event_hash TEXT NOT NULL
             );
+
             CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                nominee_id INTEGER REFERENCES nominees(id) ON DELETE SET NULL,
-                case_id INTEGER REFERENCES death_cases(id) ON DELETE SET NULL,
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                owner_id BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                nominee_id BIGINT REFERENCES public.nominees(id) ON DELETE SET NULL,
+                case_id BIGINT REFERENCES public.death_cases(id) ON DELETE SET NULL,
                 notification_type TEXT NOT NULL,
                 state_transition TEXT NOT NULL,
                 recipient_email TEXT NOT NULL,
@@ -524,15 +529,13 @@ def init_database() -> None:
                 error_message TEXT DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_notifications_dup_check 
-                ON notifications(owner_id, notification_type, state_transition, recipient_email);
+                ON public.notifications(owner_id, notification_type, state_transition, recipient_email);
             """
         )
         migrate_schema(connection)
 
 
-def audit(connection: sqlite3.Connection, owner_id: Optional[int], event: str) -> None:
-    if not connection.in_transaction:
-        connection.execute("BEGIN IMMEDIATE")
+def audit(connection: Any, owner_id: Optional[int], event: str) -> None:
     previous = connection.execute(
         "SELECT event_hash FROM audit_logs ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -574,7 +577,7 @@ def normalize_time_to_seconds(value: int, unit: str) -> int:
     return total_seconds
 
 
-def public_user(row: sqlite3.Row) -> dict:
+def public_user(row: dict) -> dict:
     keys = row.keys() if hasattr(row, "keys") else []
     return {
         "id": row["id"],
@@ -673,8 +676,8 @@ class DeathCaseReviewPayload(BaseModel):
 
 
 def invitation_target(
-    connection: sqlite3.Connection, owner_id: int, role: str, target_id: int
-) -> sqlite3.Row:
+    connection: Any, owner_id: int, role: str, target_id: int
+) -> dict:
     if role == "nominee":
         target = connection.execute(
             "SELECT id,name,email FROM nominees WHERE id=? AND owner_id=?",
@@ -693,7 +696,7 @@ def invitation_target(
 
 
 def revoke_target_invitations(
-    connection: sqlite3.Connection,
+    connection: Any,
     owner_id: int,
     role: str,
     target_id: int,
@@ -739,7 +742,7 @@ def _password_hash(password: str) -> bytes:
 
 
 def _log_recipient_event(
-    connection: sqlite3.Connection,
+    connection: Any,
     recipient_id: int,
     owner_id: int,
     event_type: str,
@@ -1165,7 +1168,7 @@ async def run_background_scheduler() -> None:
         await asyncio.sleep(15)
 
 
-def _medical_hold_state(connection: sqlite3.Connection, owner_id: int) -> dict:
+def _medical_hold_state(connection: Any, owner_id: int) -> dict:
     row = connection.execute(
         "SELECT status,started_at,ended_at,updated_at FROM medical_holds WHERE owner_id=?",
         (owner_id,),
@@ -1179,7 +1182,7 @@ def _medical_hold_state(connection: sqlite3.Connection, owner_id: int) -> dict:
 
 
 def _set_document_release(
-    connection: sqlite3.Connection, document_id: int, recipient_id: int, status: str
+    connection: Any, document_id: int, recipient_id: int, status: str
 ) -> None:
     now = utc_now().isoformat()
     existing = connection.execute(
@@ -1214,7 +1217,7 @@ def _set_document_release(
 
 
 def _replace_document_shares(
-    connection: sqlite3.Connection,
+    connection: Any,
     owner_id: int,
     document_id: int,
     recipient_ids: list[int],
@@ -1260,7 +1263,7 @@ def _replace_document_shares(
             )
 
 
-def _recipient_documents(connection: sqlite3.Connection, recipient_id: int) -> list[dict]:
+def _recipient_documents(connection: Any, recipient_id: int) -> list[dict]:
     owner = connection.execute(
         "SELECT owner_id FROM recipients WHERE id=?", (recipient_id,)
     ).fetchone()
@@ -1612,7 +1615,7 @@ def issue_token(user_id: int) -> str:
 
 def current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-) -> sqlite3.Row:
+) -> dict:
     if not credentials:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Please sign in to continue.")
     try:
@@ -1643,7 +1646,7 @@ def root_status():
         "status": "ok",
         "service": "CloudGuard Vault API",
         "version": "1.0.0",
-        "database": "postgresql" if is_postgres() else "sqlite",
+        "database": "postgresql",
         "docs": "/docs",
         "health": "/api/health",
     }
@@ -1745,7 +1748,7 @@ def sanitized_resend_error(error: ResendError, secrets_to_redact: list[str]) -> 
 @app.post("/api/invitations", status_code=201)
 def create_invitation(
     payload: CreateInvitationPayload,
-    user: sqlite3.Row = Depends(current_user),
+    user: dict = Depends(current_user),
 ) -> dict:
     """Create an invitation. Email (Resend) is optional.
 
@@ -1856,7 +1859,7 @@ def create_invitation(
     }
 
 @app.get("/api/invitations")
-def list_invitations(user: sqlite3.Row = Depends(current_user)) -> dict:
+def list_invitations(user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         rows = connection.execute(
             """SELECT id,email,role,target_id,status,created_at,expires_at,sent_at,claimed_at,revoked_at
@@ -1873,7 +1876,7 @@ def list_invitations(user: sqlite3.Row = Depends(current_user)) -> dict:
 
 
 @app.delete("/api/invitations/{invitation_id}", status_code=204)
-def revoke_invitation(invitation_id: int, user: sqlite3.Row = Depends(current_user)) -> None:
+def revoke_invitation(invitation_id: int, user: dict = Depends(current_user)) -> None:
     now = utc_now().isoformat()
     with db() as connection:
         invitation = connection.execute(
@@ -2227,7 +2230,7 @@ def nominee_logout(nominee: dict = Depends(nominee_principal)) -> None:
         audit(connection, nominee["owner_id"], f"nominee.signed_out:{nominee['nominee_id']}")
 
 
-def _nominee_case_summary(connection: sqlite3.Connection, nominee_id: int) -> Optional[dict]:
+def _nominee_case_summary(connection: Any, nominee_id: int) -> Optional[dict]:
     row = connection.execute(
         """SELECT id,status,note,evidence_name,evidence_type,evidence_size,
                   reviewer_message,extracted_name,extracted_dob,extracted_doc_type,extracted_doc_number,
@@ -3171,7 +3174,7 @@ def login(payload: LoginPayload) -> dict:
 @app.post("/api/auth/logout", status_code=204)
 def logout(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    user: sqlite3.Row = Depends(current_user),
+    user: dict = Depends(current_user),
 ) -> None:
     payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
     with db() as connection:
@@ -3183,12 +3186,12 @@ def logout(
 
 
 @app.get("/api/auth/me")
-def me(user: sqlite3.Row = Depends(current_user)) -> dict:
+def me(user: dict = Depends(current_user)) -> dict:
     return {"user": public_user(user)}
 
 
 @app.get("/api/dashboard")
-def dashboard(user: sqlite3.Row = Depends(current_user)) -> dict:
+def dashboard(user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         last = connection.execute(
             "SELECT created_at,status,mode FROM checkins WHERE owner_id=? ORDER BY id DESC LIMIT 1",
@@ -3224,7 +3227,7 @@ def dashboard(user: sqlite3.Row = Depends(current_user)) -> dict:
 
 
 @app.get("/api/documents")
-def list_documents(user: sqlite3.Row = Depends(current_user)) -> dict:
+def list_documents(user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         rows = connection.execute(
             """SELECT id,name,category,file_name,content_type,file_size,created_at
@@ -3293,7 +3296,7 @@ async def upload_document(
     category: str = Form(..., min_length=2, max_length=40),
     recipient_ids_json: str = Form(default="[]"),
     file: UploadFile = File(...),
-    user: sqlite3.Row = Depends(current_user),
+    user: dict = Depends(current_user),
 ) -> dict:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -3346,7 +3349,7 @@ class UpdateSharesPayload(BaseModel):
 
 
 def _validate_recipient_ownership(
-    connection: sqlite3.Connection, owner_id: int, recipient_ids: list[int]
+    connection: Any, owner_id: int, recipient_ids: list[int]
 ) -> None:
     if not recipient_ids:
         return
@@ -3360,7 +3363,7 @@ def _validate_recipient_ownership(
 
 @app.put("/api/documents/{document_id}/shares")
 def update_document_shares(
-    document_id: int, payload: UpdateSharesPayload, user: sqlite3.Row = Depends(current_user)
+    document_id: int, payload: UpdateSharesPayload, user: dict = Depends(current_user)
 ) -> dict:
     with db() as connection:
         doc = connection.execute("SELECT id FROM documents WHERE id=? AND owner_id=?", (document_id, user["id"])).fetchone()
@@ -3376,7 +3379,7 @@ def update_document_shares(
 
 @app.post("/api/documents/{document_id}/releases", status_code=200)
 def approve_document_release(
-    document_id: int, payload: ReleasePayload, user: sqlite3.Row = Depends(current_user)
+    document_id: int, payload: ReleasePayload, user: dict = Depends(current_user)
 ) -> dict:
     with db() as connection:
         document = connection.execute(
@@ -3425,7 +3428,7 @@ def approve_document_release(
 
 @app.delete("/api/documents/{document_id}/releases/{recipient_id}", status_code=200)
 def revoke_document_release(
-    document_id: int, recipient_id: int, user: sqlite3.Row = Depends(current_user)
+    document_id: int, recipient_id: int, user: dict = Depends(current_user)
 ) -> dict:
     with db() as connection:
         document = connection.execute(
@@ -3449,7 +3452,7 @@ def revoke_document_release(
 
 
 @app.get("/api/medical-hold")
-def get_medical_hold(user: sqlite3.Row = Depends(current_user)) -> dict:
+def get_medical_hold(user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         hold = _medical_hold_state(connection, user["id"])
     return {"medical_hold": hold}
@@ -3457,7 +3460,7 @@ def get_medical_hold(user: sqlite3.Row = Depends(current_user)) -> dict:
 
 @app.put("/api/medical-hold")
 def update_medical_hold(
-    payload: MedicalHoldPayload, user: sqlite3.Row = Depends(current_user)
+    payload: MedicalHoldPayload, user: dict = Depends(current_user)
 ) -> dict:
     now = utc_now().isoformat()
     with db() as connection:
@@ -3488,7 +3491,7 @@ def update_medical_hold(
 
 
 @app.get("/api/documents/{document_id}/download")
-def download_document(document_id: int, user: sqlite3.Row = Depends(current_user)) -> Response:
+def download_document(document_id: int, user: dict = Depends(current_user)) -> Response:
     with db() as connection:
         row = connection.execute(
             "SELECT * FROM documents WHERE id=? AND owner_id=?", (document_id, user["id"])
@@ -3509,7 +3512,7 @@ def download_document(document_id: int, user: sqlite3.Row = Depends(current_user
 
 
 @app.delete("/api/documents/{document_id}", status_code=204)
-def delete_document(document_id: int, user: sqlite3.Row = Depends(current_user)) -> None:
+def delete_document(document_id: int, user: dict = Depends(current_user)) -> None:
     with db() as connection:
         cursor = connection.execute(
             "DELETE FROM documents WHERE id=? AND owner_id=?", (document_id, user["id"])
@@ -3520,7 +3523,7 @@ def delete_document(document_id: int, user: sqlite3.Row = Depends(current_user))
 
 
 @app.get("/api/recipients")
-def list_recipients(user: sqlite3.Row = Depends(current_user)) -> dict:
+def list_recipients(user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         rows = connection.execute(
             "SELECT id,name,email,relationship,created_at FROM recipients WHERE owner_id=? ORDER BY id DESC",
@@ -3530,7 +3533,7 @@ def list_recipients(user: sqlite3.Row = Depends(current_user)) -> dict:
 
 
 @app.post("/api/recipients", status_code=201)
-def create_recipient(payload: RecipientPayload, user: sqlite3.Row = Depends(current_user)) -> dict:
+def create_recipient(payload: RecipientPayload, user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         cursor = connection.execute(
             "INSERT INTO recipients(owner_id,name,email,relationship,created_at) VALUES(?,?,?,?,?)",
@@ -3547,7 +3550,7 @@ def create_recipient(payload: RecipientPayload, user: sqlite3.Row = Depends(curr
 
 @app.patch("/api/recipients/{recipient_id}")
 def update_recipient(
-    recipient_id: int, payload: RecipientPayload, user: sqlite3.Row = Depends(current_user)
+    recipient_id: int, payload: RecipientPayload, user: dict = Depends(current_user)
 ) -> dict:
     with db() as connection:
         revoke_target_invitations(connection, user["id"], "recipient", recipient_id)
@@ -3568,7 +3571,7 @@ def update_recipient(
 
 
 @app.delete("/api/recipients/{recipient_id}", status_code=204)
-def delete_recipient(recipient_id: int, user: sqlite3.Row = Depends(current_user)) -> None:
+def delete_recipient(recipient_id: int, user: dict = Depends(current_user)) -> None:
     with db() as connection:
         revoke_target_invitations(connection, user["id"], "recipient", recipient_id)
         cursor = connection.execute(
@@ -3580,7 +3583,7 @@ def delete_recipient(recipient_id: int, user: sqlite3.Row = Depends(current_user
 
 
 @app.get("/api/nominee")
-def get_nominee(user: sqlite3.Row = Depends(current_user)) -> dict:
+def get_nominee(user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         row = connection.execute(
             """SELECT id,name,email,relationship,phone,created_at,updated_at
@@ -3591,7 +3594,7 @@ def get_nominee(user: sqlite3.Row = Depends(current_user)) -> dict:
 
 
 @app.put("/api/nominee")
-def save_nominee(payload: NomineePayload, user: sqlite3.Row = Depends(current_user)) -> dict:
+def save_nominee(payload: NomineePayload, user: dict = Depends(current_user)) -> dict:
     now = utc_now().isoformat()
     with db() as connection:
         existing = connection.execute(
@@ -3621,7 +3624,7 @@ def save_nominee(payload: NomineePayload, user: sqlite3.Row = Depends(current_us
 
 
 @app.delete("/api/nominee", status_code=204)
-def delete_nominee(user: sqlite3.Row = Depends(current_user)) -> None:
+def delete_nominee(user: dict = Depends(current_user)) -> None:
     with db() as connection:
         existing = connection.execute(
             "SELECT id FROM nominees WHERE owner_id=?", (user["id"],)
@@ -3637,7 +3640,7 @@ def delete_nominee(user: sqlite3.Row = Depends(current_user)) -> None:
 def create_checkin(
     sentence: str = Form(..., min_length=5, max_length=250),
     recording: UploadFile = File(...),
-    user: sqlite3.Row = Depends(current_user),
+    user: dict = Depends(current_user),
 ) -> dict:
     if sentence not in CHECKIN_SENTENCES:
         raise HTTPException(status_code=422, detail="The check-in phrase is not valid. Start a new check-in and try again.")
@@ -3763,7 +3766,7 @@ def create_checkin(
 
 
 @app.get("/api/check-ins")
-def list_checkins(user: sqlite3.Row = Depends(current_user)) -> dict:
+def list_checkins(user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         rows = connection.execute(
             """SELECT id,mode,status,face_status,liveness_status,speech_status,sentence,created_at
@@ -3774,7 +3777,7 @@ def list_checkins(user: sqlite3.Row = Depends(current_user)) -> dict:
 
 
 @app.patch("/api/profile")
-def update_profile(payload: ProfilePayload, user: sqlite3.Row = Depends(current_user)) -> dict:
+def update_profile(payload: ProfilePayload, user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         connection.execute(
             "UPDATE users SET name=?,phone=?,checkin_interval=? WHERE id=?",
@@ -3812,7 +3815,7 @@ def reviewer_case_detail(case_id: int, reviewer: dict = Depends(reviewer_princip
 
 
 @app.get("/api/owner/security-settings")
-def get_security_settings(user: sqlite3.Row = Depends(current_user)) -> dict:
+def get_security_settings(user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         row = connection.execute(
             """SELECT checkin_frequency_value, checkin_frequency_unit, checkin_frequency_seconds,
@@ -3828,7 +3831,7 @@ def get_security_settings(user: sqlite3.Row = Depends(current_user)) -> dict:
 @app.put("/api/owner/security-settings")
 def update_security_settings(
     payload: SecuritySettingsPayload,
-    user: sqlite3.Row = Depends(current_user),
+    user: dict = Depends(current_user),
 ) -> dict:
     freq_sec = normalize_time_to_seconds(payload.checkin_frequency_value, payload.checkin_frequency_unit)
     grace_sec = normalize_time_to_seconds(payload.grace_period_value, payload.grace_period_unit)
@@ -3883,7 +3886,7 @@ def update_security_settings(
 
 
 @app.get("/api/owner/audit-logs")
-def get_owner_audit_logs(user: sqlite3.Row = Depends(current_user)) -> dict:
+def get_owner_audit_logs(user: dict = Depends(current_user)) -> dict:
     with db() as connection:
         rows = connection.execute(
             """SELECT id, event, created_at, previous_hash, event_hash
@@ -3896,7 +3899,7 @@ def get_owner_audit_logs(user: sqlite3.Row = Depends(current_user)) -> dict:
 
 
 @app.get("/api/owner/checkin-status")
-def get_owner_checkin_status(user: sqlite3.Row = Depends(current_user)) -> dict:
+def get_owner_checkin_status(user: dict = Depends(current_user)) -> dict:
     now = utc_now()
     with db() as connection:
         row = connection.execute(

@@ -38,14 +38,12 @@ import base64
 import json
 import os
 import secrets
-import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # Set environment
-os.environ.setdefault("CLOUDGUARD_DATABASE", "cloudguard_test.db")
 os.environ.setdefault("CLOUDGUARD_ENV", "development")
 
 from fastapi.testclient import TestClient

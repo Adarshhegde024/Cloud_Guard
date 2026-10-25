@@ -773,7 +773,7 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=45,
+            timeout=85,
         )
         face_result = None
         worker_error = None

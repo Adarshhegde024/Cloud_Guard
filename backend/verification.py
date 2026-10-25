@@ -490,6 +490,19 @@ def _enrollment_embeddings(DeepFace, cv2, enrollment_images: list) -> list:
     return embeddings
 
 
+def _compare_face_to_enrollment(DeepFace, cv2, live_frame, enrollment_images: list) -> bool:
+    """
+    Return True if the live face matches a majority of enrollment images.
+    Faces must be detected; whole-frame / background comparisons are not used.
+    """
+    live_embedding = _embedding_from_frame(DeepFace, cv2, live_frame)
+    if live_embedding is None:
+        return False
+    return _identity_matches_enrollment(
+        live_embedding, _enrollment_embeddings(DeepFace, cv2, enrollment_images)
+    )
+
+
 def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) -> dict:
     """Evaluate face match and liveness in an isolated worker process."""
     try:
@@ -667,12 +680,18 @@ def verify_recording(
             raise VerificationUnavailable("Local verification models are unavailable.")
 
         # 1. Transcribe speech in isolated worker process (memory freed upon exit)
+        logger.info("[CHECKIN] speech verification started")
         transcript = _run_speech_subprocess(video_path)
+        speech_status = "passed" if _phrase_matches(sentence, transcript) else "failed"
+        logger.info("[CHECKIN] speech verification completed")
 
         # 2. Evaluate face match & liveness in isolated worker process (memory freed upon exit)
+        logger.info("[CHECKIN] face verification started")
         face_res = _run_face_subprocess(video_path, encoded_samples)
+        logger.info("[CHECKIN] face verification completed")
 
-        speech_status = "passed" if _phrase_matches(sentence, transcript) else "failed"
+        logger.info("[CHECKIN] liveness verification started")
+        logger.info("[CHECKIN] liveness verification completed")
 
         result = {
             "face_status": face_res.get("face_status", "failed"),

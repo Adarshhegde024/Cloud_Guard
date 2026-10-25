@@ -83,16 +83,25 @@ async function api(path, { token, timeoutMs, ...options } = {}) {
   if (!(options.body instanceof FormData) && options.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
-  const timeoutSignal = timeoutMs ? AbortSignal.timeout(timeoutMs) : null
-  const signal = options.signal && timeoutSignal
-    ? AbortSignal.any([options.signal, timeoutSignal])
-    : (options.signal || timeoutSignal)
+  let timeoutId = null
+  let controller = null
+  let signal = options.signal
+  if (timeoutMs && typeof AbortController !== 'undefined') {
+    controller = new AbortController()
+    timeoutId = setTimeout(() => {
+      controller.abort(new DOMException('Verification is taking too long. Please try again.', 'TimeoutError'))
+    }, timeoutMs)
+    if (options.signal) {
+      options.signal.addEventListener('abort', () => controller.abort(options.signal.reason))
+    }
+    signal = controller.signal
+  }
   let response
   try {
     response = await fetch(`${API_URL}${path}`, { ...options, headers, signal })
   } catch (error) {
-    if (error?.name === 'AbortError' || error?.name === 'TimeoutError') {
-      throw new Error('Verification timed out. Please try again; the first check-in can take about a minute while models load.')
+    if (error?.name === 'AbortError' || error?.name === 'TimeoutError' || error?.message?.includes('taking too long')) {
+      throw new Error('Verification is taking too long. Please try again.')
     }
     if (error instanceof TypeError) {
       const isLocalhost = typeof window !== 'undefined' && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
@@ -103,10 +112,15 @@ async function api(path, { token, timeoutMs, ...options } = {}) {
       }
     }
     throw error
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId)
   }
   if (!response.ok) {
     const body = await response.json().catch(() => ({}))
-    throw new Error(describeError(body.detail, response.status))
+    const err = new Error(describeError(body.detail || body.message || body.error, response.status))
+    err.status = response.status
+    err.data = body
+    throw err
   }
   if (response.status === 204) return null
   return response.json()
@@ -2037,7 +2051,7 @@ function App() {
           {page === 'documents' && <Documents data={pageData.documents || []} token={token} onChange={load} />}
           {page === 'recipients' && <Recipients data={pageData.recipients || []} token={token} onChange={load} />}
           {page === 'nominee' && <Nominee data={pageData.nominee || null} token={token} onChange={load} />}
-          {page === 'checkin' && <Checkin token={token} onComplete={async (checkin) => { await load(); notify(checkin.status === 'success' ? 'Check-in passed.' : checkin.face_status !== 'passed' && (checkin.face_detail === 'different_person' || checkin.face_detail === 'mismatch') ? 'Check-in failed: the live face does not match enrollment.' : 'Check-in recorded. Verification did not pass.') }} />}
+          {page === 'checkin' && <Checkin token={token} onNavigate={navigate} onComplete={async (checkin) => { await load(); notify(checkin.status === 'success' ? 'Check-in passed.' : checkin.face_status !== 'passed' && (checkin.face_detail === 'different_person' || checkin.face_detail === 'mismatch') ? 'Check-in failed: the live face does not match enrollment.' : 'Check-in recorded. Verification did not pass.') }} />}
           {page === 'settings' && <LegacySecuritySettings token={token} user={user} onRefresh={load} notify={notify} />}
           {page === 'history' && <History data={pageData.checkins || []} token={token} />}
           {page === 'profile' && <Profile data={user} token={token} onSave={(updated) => { setUser(updated); localStorage.setItem('cloudguard_user', JSON.stringify(updated)); notify('Your profile has been updated.') }} />}
@@ -2768,19 +2782,20 @@ function checkinResultCopy(result) {
   }
 }
 
-function Checkin({ token, onComplete }) {
+function Checkin({ token, onComplete, onNavigate }) {
   const videoRef = useRef(null)
   const streamRef = useRef(null)
   const recorderRef = useRef(null)
   const timerRef = useRef(null)
-  const [step, setStep] = useState('ready')
+
+  // Explicit state management: 'idle' | 'recording' | 'recorded' | 'submitting' | 'success' | 'failed' | 'unavailable'
+  const [state, setState] = useState('idle')
   const [streamOn, setStreamOn] = useState(false)
   const [seconds, setSeconds] = useState(12)
-  const [sentence, setSentence] = useState('')
+  const [sentence, setSentence] = useState(SENTENCES[0])
   const [error, setError] = useState('')
-  const [result, setResult] = useState(null)
   const [hasClip, setHasClip] = useState(false)
-  const [loading, setLoading] = useState(false)
+  const [verificationResult, setVerificationResult] = useState(null)
   const recordingChunks = useRef([])
   const recordingClip = useRef(null)
   const [verificationReady, setVerificationReady] = useState(null)
@@ -2809,13 +2824,16 @@ function Checkin({ token, onComplete }) {
 
   async function openCamera() {
     setError('')
-    setResult(null)
+    setVerificationResult(null)
     if (!navigator.mediaDevices?.getUserMedia) {
       setError('Camera access needs a secure browser context (HTTPS or localhost).')
       return
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }, audio: { echoCancellation: true, noiseSuppression: true } })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: { echoCancellation: true, noiseSuppression: true },
+      })
       streamRef.current = stream
       if (videoRef.current) {
         videoRef.current.srcObject = stream
@@ -2823,7 +2841,7 @@ function Checkin({ token, onComplete }) {
       }
       setStreamOn(true)
       setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
-      setStep('camera')
+      setState('idle')
     } catch {
       setError('Please allow camera and microphone access in your browser to continue.')
     }
@@ -2831,7 +2849,7 @@ function Checkin({ token, onComplete }) {
 
   function startRecording() {
     setError('')
-    setResult(null)
+    setVerificationResult(null)
     const stream = streamRef.current
     if (!stream || !window.MediaRecorder) {
       setError('This browser cannot record a check-in. Try the latest version of Chrome, Edge or Firefox.')
@@ -2840,7 +2858,7 @@ function Checkin({ token, onComplete }) {
     try {
       const mimeType = typeof MediaRecorder.isTypeSupported === 'function'
         ? ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4']
-          .find((type) => MediaRecorder.isTypeSupported(type))
+            .find((type) => MediaRecorder.isTypeSupported(type))
         : undefined
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
       recorderRef.current = recorder
@@ -2854,11 +2872,11 @@ function Checkin({ token, onComplete }) {
         const clip = new Blob(recordingChunks.current, { type: recorder.mimeType || 'video/webm' })
         recordingClip.current = clip
         setHasClip(clip.size > 0)
-        setStep('recorded')
+        setState('recorded')
       }
       recorder.start()
       setSeconds(12)
-      setStep('recording')
+      setState('recording')
       timerRef.current = window.setInterval(() => setSeconds((remaining) => {
         if (remaining <= 1) {
           window.clearInterval(timerRef.current)
@@ -2876,65 +2894,346 @@ function Checkin({ token, onComplete }) {
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
     setStreamOn(false)
-    setStep('ready')
+    setState('idle')
     setHasClip(false)
     recordingClip.current = null
   }
 
-  async function saveCheckin() {
-    setLoading(true)
+  function handleTryAgain() {
     setError('')
+    setVerificationResult(null)
+    setHasClip(false)
+    recordingClip.current = null
+    setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
+    if (streamRef.current) {
+      setState('idle')
+    } else {
+      openCamera()
+    }
+  }
+
+  async function saveCheckin() {
+    setError('')
+    setState('submitting')
+
     try {
       const clip = recordingClip.current
-      if (!clip?.size) throw new Error('No check-in recording is available. Please record again.')
+      if (!clip?.size) {
+        throw new Error('No check-in recording is available. Please record again.')
+      }
       const form = new FormData()
       form.append('sentence', sentence)
       form.append('recording', clip, `check-in.${clip.type.includes('mp4') ? 'mp4' : 'webm'}`)
-      const response = await api('/check-ins', { token, method: 'POST', body: form, timeoutMs: 120000 })
-      setResult(response.checkin)
-      recordingClip.current = null
-      setStep('result')
-      await onComplete(response.checkin)
-    } catch (requestError) {
-      const msg = requestError.message || ''
-      if (msg.includes('unavailable') || msg.includes('503') || requestError.status === 503) {
-        setError('Live verification is temporarily unavailable. Please try again later.')
-      } else if (msg.includes('did not pass') || msg.includes('failed') || requestError.status === 422) {
-        setError('Verification failed. Please make sure your face is clearly visible, look directly into the camera, and repeat the phrase clearly.')
-      } else {
-        setError(msg || 'Check-in verification failed. Please try again.')
+
+      // 65-second client timeout ensures the UI is never permanently stuck in 'submitting'
+      const response = await api('/check-ins', {
+        token,
+        method: 'POST',
+        body: form,
+        timeoutMs: 65000,
+      })
+
+      if (!response) {
+        throw new Error('No response received from verification server.')
       }
+
+      if (response.status === 'verification_unavailable' || response.checks?.face === 'unavailable') {
+        setState('unavailable')
+        setVerificationResult({
+          status: 'unavailable',
+          message: response.message || 'Live verification services are currently unavailable.',
+          checks: { face: 'unavailable', liveness: 'unavailable', voice: 'unavailable' },
+        })
+        return
+      }
+
+      const isPassed = Boolean(response.success || response.passed || response.status === 'success')
+
+      if (isPassed) {
+        setState('success')
+        setVerificationResult({
+          status: 'success',
+          message: 'Check-in verified successfully.',
+          checks: {
+            face: response.checks?.face || response.checkin?.face_status || 'passed',
+            liveness: response.checks?.liveness || response.checkin?.liveness_status || 'passed',
+            voice: response.checks?.voice || response.checkin?.speech_status || 'passed',
+          },
+          checkinTime: response.checkin_time || response.checkin?.created_at || new Date().toISOString(),
+          nextDeadline: response.next_checkin_deadline || null,
+          checkin: response.checkin,
+        })
+        recordingClip.current = null
+        if (onComplete && response.checkin) {
+          await onComplete(response.checkin)
+        }
+      } else {
+        setState('failed')
+        setVerificationResult({
+          status: 'failed',
+          message: 'Check-in verification failed.',
+          failureReason: response.failure_reason || response.message || 'Face, liveness, or voice check did not pass.',
+          checks: {
+            face: response.checks?.face || response.checkin?.face_status || 'failed',
+            liveness: response.checks?.liveness || response.checkin?.liveness_status || 'failed',
+            voice: response.checks?.voice || response.checkin?.speech_status || 'failed',
+          },
+          checkin: response.checkin,
+        })
+        if (onComplete && response.checkin) {
+          await onComplete(response.checkin)
+        }
+      }
+    } catch (requestError) {
+      const errData = requestError.data || {}
+      if (errData.status === 'verification_unavailable' || requestError.status === 503) {
+        setState('unavailable')
+        setVerificationResult({
+          status: 'unavailable',
+          message: errData.message || 'Live verification services are currently unavailable.',
+          checks: { face: 'unavailable', liveness: 'unavailable', voice: 'unavailable' },
+        })
+      } else {
+        setState('failed')
+        const isTimeout = requestError.message?.includes('taking too long') || requestError.name === 'TimeoutError'
+        const failMsg = isTimeout
+          ? 'Verification is taking too long. Please try again.'
+          : (requestError.message || 'Check-in verification failed. Please try again.')
+        setVerificationResult({
+          status: 'failed',
+          message: 'Check-in verification failed.',
+          failureReason: failMsg,
+          checks: { face: 'failed', liveness: 'failed', voice: 'failed' },
+        })
+      }
+    } finally {
+      // Guaranteed cleanup: resets 'submitting' state if an unexpected throw bypassed normal assignment
+      setState((curr) => (curr === 'submitting' ? 'failed' : curr))
     }
-    finally { setLoading(false) }
   }
 
-  const resultCopy = result ? checkinResultCopy(result) : null
-
   return <div className="page-content checkin-page">
-    <div className="verification-banner"><span className="verification-banner-icon"><Icon name="scan" size={18} /></span><span><b>{verificationReady ? 'Live AI verification active' : 'Live verification is temporarily unavailable'}</b><small>{verificationReady ? 'CloudGuard verifies face match against your enrollment samples, anti-spoof liveness, and the spoken phrase. All three checks must pass.' : 'Live verification models are currently loading or unavailable. Please try again in a few moments.'}</small></span><span className={`verification-indicator ${verificationReady ? 'verification-ready' : ''}`}><span className="live-dot" /> {verificationReady ? 'AI ACTIVE' : 'UNAVAILABLE'}</span></div>
+    <div className="verification-banner">
+      <span className="verification-banner-icon"><Icon name="scan" size={18} /></span>
+      <span>
+        <b>{verificationReady ? 'Live AI verification active' : 'Live verification is temporarily unavailable'}</b>
+        <small>{verificationReady ? 'CloudGuard verifies face match against your enrollment samples, anti-spoof liveness, and the spoken phrase. All three checks must pass.' : 'Live verification models are currently loading or unavailable. Please try again in a few moments.'}</small>
+      </span>
+      <span className={`verification-indicator ${verificationReady ? 'verification-ready' : ''}`}>
+        <span className="live-dot" /> {verificationReady ? 'AI ACTIVE' : 'UNAVAILABLE'}
+      </span>
+    </div>
     <div className="checkin-layout">
       <section className="surface checkin-flow">
-        <div className="section-title-row"><div><span className="eyebrow">A MOMENT FOR YOU</span><h3>Complete a check-in</h3></div><span className="checkin-duration"><Icon name="clock" size={14} /> ABOUT 12 SEC</span></div>
-        <div className="checkin-steps">
-          <div className={`checkin-step ${step !== 'ready' ? 'step-done' : 'step-current'}`}><span>01</span><div><b>Allow camera & microphone</b><small>They’re used only for this check-in.</small></div>{step !== 'ready' && <span className="step-check">✓</span>}</div>
-          <div className={`checkin-step ${['camera', 'recording', 'recorded', 'result'].includes(step) ? 'step-current' : ''}`}><span>02</span><div><b>Read your personal phrase</b><small>A new phrase is chosen each time.</small></div></div>
-          <div className={`checkin-step ${['recording', 'recorded', 'result'].includes(step) ? 'step-current' : ''}`}><span>03</span><div><b>Record a short live clip</b><small>Keep your face in frame as you speak.</small></div></div>
-          <div className={`checkin-step ${step === 'result' ? 'step-current' : ''}`}><span>04</span><div><b>Review your result</b><small>See whether verification passed.</small></div></div>
+        <div className="section-title-row">
+          <div><span className="eyebrow">A MOMENT FOR YOU</span><h3>Complete a check-in</h3></div>
+          <span className="checkin-duration"><Icon name="clock" size={14} /> ABOUT 12 SEC</span>
         </div>
-        {['camera', 'recording', 'recorded'].includes(step) && <div className="checkin-phrase"><span className="eyebrow">READ THIS PHRASE ALOUD</span><p>"{sentence}"</p><small>Speak clearly and naturally while looking at the camera.</small></div>}
+        <div className="checkin-steps">
+          <div className={`checkin-step ${streamOn ? 'step-done' : 'step-current'}`}>
+            <span>01</span><div><b>Allow camera & microphone</b><small>They’re used only for this check-in.</small></div>{streamOn && <span className="step-check">✓</span>}
+          </div>
+          <div className={`checkin-step ${streamOn && state !== 'success' && state !== 'failed' && state !== 'unavailable' ? 'step-current' : ''}`}>
+            <span>02</span><div><b>Read your personal phrase</b><small>A new phrase is chosen each time.</small></div>
+          </div>
+          <div className={`checkin-step ${state === 'recording' || state === 'recorded' || state === 'submitting' ? 'step-current' : ''}`}>
+            <span>03</span><div><b>Record a short live clip</b><small>Keep your face in frame as you speak.</small></div>
+          </div>
+          <div className={`checkin-step ${state === 'success' || state === 'failed' || state === 'unavailable' ? 'step-current' : ''}`}>
+            <span>04</span><div><b>Review your result</b><small>See whether verification passed.</small></div>
+          </div>
+        </div>
+
+        {streamOn && (state === 'idle' || state === 'recording' || state === 'recorded' || state === 'submitting') && (
+          <div className="checkin-phrase">
+            <span className="eyebrow">READ THIS PHRASE ALOUD</span>
+            <p>"{sentence}"</p>
+            <small>Speak clearly and naturally while looking directly at the camera.</small>
+          </div>
+        )}
+
         {error && <div className="notice notice-error">{error}</div>}
-        {step === 'ready' && <div className="checkin-tips"><Icon name="shield" size={15} /><span><b>Tips for a successful check-in:</b><ul style={{margin:'6px 0 0 0',paddingLeft:'18px',fontSize:'0.85em'}}><li>Face the light source - good lighting is key.</li><li>Centre your face in the camera frame.</li><li>Speak the phrase clearly at a natural pace.</li><li>Use the same camera as during enrollment.</li></ul></span></div>}
-        {step === 'ready' && <div className="checkin-privacy"><Icon name="lock" size={15} /><span>Your recording is sent to this server for verification, then deleted. Only the phrase and check results are saved.</span></div>}
-        {step === 'ready' && <button className="button button-primary" onClick={openCamera}>Begin check-in <Icon name="arrow" size={17} /></button>}
-        {step === 'camera' && <div className="phrase-panel"><div className="button-row"><button className="button button-primary" onClick={startRecording}><span className="record-dot" /> Start 12-second recording</button><button className="button button-quiet" onClick={stopCamera}>Cancel</button></div></div>}
-        {step === 'recording' && <div className="recording-panel"><span className="recording-pulse" /><b>Recording — read the phrase above aloud</b><span className="timer-count">{seconds}<small>sec</small></span><div className="recording-progress-bar"><span style={{ width: `${((12 - seconds) / 12) * 100}%` }} /></div><small>Speak naturally and keep your face centred in the camera.</small></div>}
-        {step === 'recorded' && <div className="phrase-panel"><span className="eyebrow">RECORDING COMPLETE</span><div className="checkin-privacy"><Icon name="shield" size={15} /><span>{hasClip ? 'Submit the clip to run face, liveness, and speech checks. The server deletes it after analysis.' : 'No recording data was captured. Please record again.'}</span></div><div className="button-row"><button className="button button-primary" onClick={saveCheckin} disabled={loading || !hasClip}>{loading ? 'Analyzing face, liveness & voice…' : 'Verify check-in'} <Icon name="arrow" size={17} /></button><button className="button button-quiet" onClick={() => { setStep('camera'); setResult(null); setHasClip(false); recordingClip.current = null }}>Try again</button></div></div>}
-        {step === 'result' && result && resultCopy && <div className="result-panel"><span className="result-checkin-icon"><Icon name="shield" size={23} /></span><span className="eyebrow">CHECK-IN RESULT</span><h3>{resultCopy.title}</h3><p>{resultCopy.summary}</p><div className="overall-result"><span>Verification status</span><b>{result.status === 'success' ? 'PASSED' : 'FAILED'}</b></div><div className="result-checks"><div><span>Face verification</span><b className={result.face_status === 'passed' ? 'available-status' : 'unavailable-status'}>{resultCopy.faceLabel}</b></div><div><span>Anti-spoof liveness</span><b className={result.liveness_status === 'passed' ? 'available-status' : 'unavailable-status'}>{result.liveness_status === 'passed' ? 'Passed' : 'Not passed'}</b></div><div><span>Speech match</span><b className={result.speech_status === 'passed' ? 'available-status' : 'unavailable-status'}>{result.speech_status === 'passed' ? 'Passed' : 'Not passed'}</b></div></div><small className="result-time">Saved {formatDate(result.created_at, { dateStyle: 'medium', timeStyle: 'short' })}</small>{result.status !== 'success' && <div className="result-hints">{[['face_status', resultCopy.faceHint],['liveness_status','Liveness check failed. Use a live camera, not a photo or screen replay.'],['speech_status','Speech not matched. Speak the phrase clearly at a normal pace, close to the microphone.']].filter(([key]) => result[key] !== 'passed').map(([key, hint]) => <div key={key} className="result-hint-item"><Icon name="close" size={14} /><span>{hint}</span></div>)}</div>}<div className="button-row" style={{marginTop:'12px'}}><button className="button button-secondary" onClick={() => { stopCamera(); setResult(null) }}>Done</button>{result.status !== 'success' && <button className="button button-quiet" onClick={() => { setStep('camera'); setResult(null); setHasClip(false); recordingClip.current = null }}>Try again</button>}</div></div>}
+
+        {!streamOn && state === 'idle' && (
+          <>
+            <div className="checkin-tips">
+              <Icon name="shield" size={15} />
+              <span>
+                <b>Tips for a successful check-in:</b>
+                <ul style={{ margin: '6px 0 0 0', paddingLeft: '18px', fontSize: '0.85em' }}>
+                  <li>Face the light source — good lighting is key.</li>
+                  <li>Centre your face clearly in the camera frame.</li>
+                  <li>Speak the phrase aloud at a natural pace.</li>
+                  <li>All three checks (face match, liveness, voice) must pass.</li>
+                </ul>
+              </span>
+            </div>
+            <div className="checkin-privacy">
+              <Icon name="lock" size={15} />
+              <span>Your recording is securely analyzed by this server and immediately deleted after processing.</span>
+            </div>
+            <button className="button button-primary" onClick={openCamera}>
+              Begin check-in <Icon name="arrow" size={17} />
+            </button>
+          </>
+        )}
+
+        {streamOn && state === 'idle' && (
+          <div className="phrase-panel">
+            <div className="button-row">
+              <button className="button button-primary" onClick={startRecording}>
+                <span className="record-dot" /> Start 12-second recording
+              </button>
+              <button className="button button-quiet" onClick={stopCamera}>Cancel</button>
+            </div>
+          </div>
+        )}
+
+        {state === 'recording' && (
+          <div className="recording-panel">
+            <span className="recording-pulse" />
+            <b>Recording — read the phrase above aloud</b>
+            <span className="timer-count">{seconds}<small>sec</small></span>
+            <div className="recording-progress-bar"><span style={{ width: `${((12 - seconds) / 12) * 100}%` }} /></div>
+            <small>Speak naturally and keep your face centred in the camera.</small>
+            <div className="button-row" style={{ marginTop: '12px' }}>
+              <button className="button button-secondary" disabled>Recording...</button>
+            </div>
+          </div>
+        )}
+
+        {(state === 'recorded' || state === 'submitting') && (
+          <div className="phrase-panel">
+            <span className="eyebrow">RECORDING COMPLETE</span>
+            <div className="checkin-privacy">
+              <Icon name="shield" size={15} />
+              <span>{hasClip ? 'Click Verify check-in to run face match, anti-spoof liveness, and voice verification.' : 'No recording data was captured. Please record again.'}</span>
+            </div>
+            <div className="button-row">
+              <button
+                className="button button-primary"
+                onClick={saveCheckin}
+                disabled={state === 'submitting' || !hasClip}
+              >
+                {state === 'submitting' ? 'Analyzing face, liveness & voice…' : 'Verify check-in'} <Icon name="arrow" size={17} />
+              </button>
+              <button
+                className="button button-quiet"
+                onClick={handleTryAgain}
+                disabled={state === 'submitting'}
+              >
+                Try again
+              </button>
+            </div>
+          </div>
+        )}
+
+        {state === 'success' && verificationResult && (
+          <div className="result-panel">
+            <span className="result-checkin-icon"><Icon name="shield" size={23} /></span>
+            <span className="eyebrow">CHECK-IN RESULT</span>
+            <h3>Check-in verified successfully.</h3>
+            <p>Face matching, anti-spoof liveness, and voice verification all passed.</p>
+            <div className="overall-result">
+              <span>Verification status</span><b>PASSED</b>
+            </div>
+            <div className="result-checks">
+              <div><span>Face matching</span><b className="available-status">Passed</b></div>
+              <div><span>Anti-spoof liveness</span><b className="available-status">Passed</b></div>
+              <div><span>Voice verification</span><b className="available-status">Passed</b></div>
+            </div>
+            <div style={{ marginTop: '14px', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+              <div><b>Check-in time:</b> {formatDate(verificationResult.checkinTime, { dateStyle: 'medium', timeStyle: 'short' })}</div>
+              {verificationResult.nextDeadline && (
+                <div style={{ marginTop: '4px' }}><b>Next check-in deadline:</b> {formatDate(verificationResult.nextDeadline, { dateStyle: 'medium', timeStyle: 'short' })}</div>
+              )}
+            </div>
+            <div className="button-row" style={{ marginTop: '16px' }}>
+              <button className="button button-primary" onClick={() => { stopCamera(); if (onNavigate) onNavigate('dashboard') }}>
+                Return to dashboard <Icon name="arrow" size={17} />
+              </button>
+              <button className="button button-secondary" disabled>Check-in verified</button>
+            </div>
+          </div>
+        )}
+
+        {state === 'failed' && verificationResult && (
+          <div className="result-panel">
+            <span className="result-checkin-icon" style={{ borderColor: 'var(--accent-red, #ef4444)' }}>
+              <Icon name="close" size={23} style={{ color: 'var(--accent-red, #ef4444)' }} />
+            </span>
+            <span className="eyebrow">CHECK-IN RESULT</span>
+            <h3>Check-in verification failed.</h3>
+            <p style={{ color: 'var(--accent-red, #dc2626)', fontWeight: 500 }}>{verificationResult.failureReason}</p>
+            <div className="overall-result">
+              <span>Verification status</span><b style={{ color: 'var(--accent-red, #dc2626)' }}>FAILED</b>
+            </div>
+            <div className="result-checks">
+              <div>
+                <span>Face matching</span>
+                <b className={verificationResult.checks.face === 'passed' ? 'available-status' : 'unavailable-status'}>
+                  {verificationResult.checks.face === 'passed' ? 'Passed' : 'Failed'}
+                </b>
+              </div>
+              <div>
+                <span>Anti-spoof liveness</span>
+                <b className={verificationResult.checks.liveness === 'passed' ? 'available-status' : 'unavailable-status'}>
+                  {verificationResult.checks.liveness === 'passed' ? 'Passed' : 'Failed'}
+                </b>
+              </div>
+              <div>
+                <span>Voice verification</span>
+                <b className={verificationResult.checks.voice === 'passed' ? 'available-status' : 'unavailable-status'}>
+                  {verificationResult.checks.voice === 'passed' ? 'Passed' : 'Failed'}
+                </b>
+              </div>
+            </div>
+            <div className="button-row" style={{ marginTop: '16px' }}>
+              <button className="button button-primary" onClick={handleTryAgain}>
+                Try again <Icon name="arrow" size={17} />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {state === 'unavailable' && verificationResult && (
+          <div className="result-panel">
+            <span className="result-checkin-icon" style={{ borderColor: 'var(--accent-amber, #f59e0b)' }}>
+              <Icon name="shield" size={23} style={{ color: 'var(--accent-amber, #f59e0b)' }} />
+            </span>
+            <span className="eyebrow">VERIFICATION UNAVAILABLE</span>
+            <h3>Live verification services are currently unavailable.</h3>
+            <p>{verificationResult.message}</p>
+            <div className="result-checks">
+              <div><span>Face matching</span><b className="unavailable-status">Unavailable</b></div>
+              <div><span>Anti-spoof liveness</span><b className="unavailable-status">Unavailable</b></div>
+              <div><span>Voice verification</span><b className="unavailable-status">Unavailable</b></div>
+            </div>
+            <div className="button-row" style={{ marginTop: '16px' }}>
+              <button className="button button-primary" onClick={handleTryAgain}>
+                Try again <Icon name="arrow" size={17} />
+              </button>
+            </div>
+          </div>
+        )}
+
         <video className={`checkin-video ${streamOn ? 'video-visible' : ''}`} ref={videoRef} muted playsInline />
       </section>
       <aside className="checkin-aside">
-        <section className="surface aside-card"><span className="aside-icon"><Icon name="shield" size={19} /></span><span className="eyebrow">YOUR PRIVACY MATTERS</span><h3>Private verification</h3><p>The recording is analyzed by this server and deleted after processing. Only verification results are retained.</p><div className="aside-separator" /><span className="aside-detail"><Icon name="lock" size={15} /> All three checks are required to pass.</span></section>
-        <section className="surface aside-card" style={{marginTop:'12px'}}><span className="aside-icon"><Icon name="scan" size={19} /></span><span className="eyebrow">FACE MATCHING</span><h3>Must match enrollment</h3><p>Your live face is compared to the 5 photos captured during registration. A different person will fail check-in.</p></section>
+        <section className="surface aside-card">
+          <span className="aside-icon"><Icon name="shield" size={19} /></span>
+          <span className="eyebrow">YOUR PRIVACY MATTERS</span>
+          <h3>Private verification</h3>
+          <p>The recording is analyzed by this server and deleted after processing. Only verification results are retained.</p>
+          <div className="aside-separator" />
+          <span className="aside-detail"><Icon name="lock" size={15} /> All three checks are required to pass.</span>
+        </section>
+        <section className="surface aside-card" style={{ marginTop: '12px' }}>
+          <span className="aside-icon"><Icon name="scan" size={19} /></span>
+          <span className="eyebrow">FACE MATCHING</span>
+          <h3>Must match enrollment</h3>
+          <p>Your live face is compared to the 5 photos captured during registration. A different person will fail check-in.</p>
+        </section>
       </aside>
     </div>
   </div>

@@ -36,7 +36,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from dotenv import dotenv_values, load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field, StrictInt
 from resend.exceptions import ResendError
@@ -3683,55 +3683,102 @@ def create_checkin(
     sentence: str = Form(..., min_length=5, max_length=250),
     recording: UploadFile = File(...),
     user: dict = Depends(current_user),
-) -> dict:
+):
+    logger.info("[CHECKIN] request received")
     if sentence not in CHECKIN_SENTENCES:
+        logger.warning("[CHECKIN ERROR] The check-in phrase is not valid.")
         raise HTTPException(status_code=422, detail="The check-in phrase is not valid. Start a new check-in and try again.")
     if not providers_available():
-        raise HTTPException(
+        logger.warning("[CHECKIN ERROR] Live verification dependencies are unavailable")
+        return JSONResponse(
             status_code=503,
-            detail="Live verification is temporarily unavailable. The server is missing verification dependencies.",
+            content={
+                "success": False,
+                "status": "verification_unavailable",
+                "message": "Live verification services are currently unavailable.",
+                "checks": {
+                    "face": "unavailable",
+                    "liveness": "unavailable",
+                    "voice": "unavailable",
+                },
+            },
         )
     suffix = Path(recording.filename or "").suffix.lower()
     if suffix not in {".webm", ".mp4", ".mov"}:
+        logger.warning("[CHECKIN ERROR] Unsupported recording format: %s", suffix)
         raise HTTPException(status_code=415, detail="Record a WebM or MP4 check-in clip.")
     data = recording.file.read(MAX_CHECKIN_BYTES + 1)
     if not data:
+        logger.warning("[CHECKIN ERROR] The check-in recording is empty.")
         raise HTTPException(status_code=400, detail="The check-in recording is empty.")
     if len(data) > MAX_CHECKIN_BYTES:
+        logger.warning("[CHECKIN ERROR] Recording exceeds 20MB limit")
         raise HTTPException(status_code=413, detail="Check-in recordings must be 20 MB or smaller.")
+    
+    logger.info("[CHECKIN] recording received")
+
     with db() as connection:
         owner = connection.execute(
             "SELECT face_enrollment FROM users WHERE id=?", (user["id"],)
         ).fetchone()
     if owner is None or owner["face_enrollment"] is None:
+        logger.warning("[CHECKIN ERROR] Face enrollment is missing for owner id=%s", user["id"])
         raise HTTPException(status_code=409, detail="Face enrollment is missing. Re-enroll your face before checking in.")
     try:
         enrollment_samples = json.loads(decrypt_bytes(owner["face_enrollment"]))
     except (ValueError, TypeError) as error:
+        logger.warning("[CHECKIN ERROR] Face enrollment data could not be decrypted")
         raise HTTPException(status_code=409, detail="Face enrollment data could not be read. Please contact support.") from error
+    
     checkin_started_at = utc_now()
     with tempfile.TemporaryDirectory(prefix="cloudguard-checkin-") as directory:
         video_path = Path(directory) / f"recording{suffix}"
         video_path.write_bytes(data)
+        logger.info("[CHECKIN] temporary file created")
         try:
             statuses = verify_recording(video_path, enrollment_samples, sentence)
             required = {"face_status", "liveness_status", "speech_status"}
             if not isinstance(statuses, dict) or not required.issubset(statuses):
                 raise VerificationUnavailable("Local verification produced an incomplete result.")
         except ValueError as error:
+            logger.warning("[CHECKIN ERROR] %s", error)
             raise HTTPException(status_code=422, detail=str(error)) from error
         except VerificationUnavailable as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
-        except Exception as error:
-            logger.exception("Local check-in verification failed.")
-            raise HTTPException(
+            logger.warning("[CHECKIN ERROR] %s", error)
+            return JSONResponse(
                 status_code=503,
-                detail="Local verification could not complete. No result was saved; check the API log and try again.",
-            ) from error
+                content={
+                    "success": False,
+                    "status": "verification_unavailable",
+                    "message": str(error) or "Live verification services are currently unavailable.",
+                    "checks": {
+                        "face": "unavailable",
+                        "liveness": "unavailable",
+                        "voice": "unavailable",
+                    },
+                },
+            )
+        except Exception as error:
+            logger.exception("[CHECKIN ERROR] Local check-in verification failed unexpectedly.")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "status": "verification_unavailable",
+                    "message": "Local verification could not complete. No result was saved; check the API log and try again.",
+                    "checks": {
+                        "face": "unavailable",
+                        "liveness": "unavailable",
+                        "voice": "unavailable",
+                    },
+                },
+            )
+
     passed = all(statuses.get(check) == "passed" for check in ("face_status", "liveness_status", "speech_status"))
     checkin_status = "success" if passed else "failed"
     event = "checkin.verified_passed" if passed else "checkin.verified_failed"
     face_detail = statuses.get("face_detail") or ("matched" if statuses.get("face_status") == "passed" else "different_person")
+    
     if not passed and statuses.get("face_status") != "passed":
         if face_detail == "different_person":
             message = "Face verification failed: this person does not match the enrolled face."
@@ -3739,10 +3786,18 @@ def create_checkin(
             message = "Face verification failed: no usable face was found in the check-in recording."
         else:
             message = "Face verification did not pass."
+    elif not passed and statuses.get("liveness_status") != "passed":
+        message = "Liveness verification failed: motion or liveliness could not be verified."
+    elif not passed and statuses.get("speech_status") != "passed":
+        message = "Voice verification failed: spoken phrase did not match the expected phrase."
     elif passed:
-        message = "All verification checks passed."
+        message = "Check-in verified successfully."
     else:
         message = "One or more verification checks did not pass."
+
+    if not passed:
+        logger.warning("[CHECKIN ERROR] %s", message)
+
     with db() as connection:
         cursor = connection.execute(
             """INSERT INTO checkins(owner_id,mode,status,face_status,liveness_status,speech_status,sentence,created_at)
@@ -3752,8 +3807,11 @@ def create_checkin(
         )
         audit(connection, user["id"], f"{event}:{cursor.lastrowid}")
         hold = _medical_hold_state(connection, user["id"])
+        now_str = utc_now().isoformat()
+        next_deadline = None
+
         if passed:
-            now_str = utc_now().isoformat()
+            logger.info("[CHECKIN] all checks passed")
             user_row = connection.execute("SELECT checkin_frequency_seconds FROM users WHERE id=?", (user["id"],)).fetchone()
             freq_sec = user_row["checkin_frequency_seconds"] if user_row and user_row["checkin_frequency_seconds"] else 2592000
             next_deadline = (utc_now() + timedelta(seconds=freq_sec)).isoformat()
@@ -3786,25 +3844,51 @@ def create_checkin(
                 )
                 audit(connection, user["id"], f"nominee.case_invalidated_by_owner_checkin:{pc['id']}")
 
-        if (
-            passed
-            and hold["status"] == "awaiting_checkin"
-            and hold["ended_at"]
-            and checkin_started_at >= safe_fromisoformat(hold["ended_at"])
-        ):
-            connection.execute(
-                "UPDATE medical_holds SET status='inactive',updated_at=? WHERE owner_id=?",
-                (utc_now().isoformat(), user["id"]),
-            )
-            audit(connection, user["id"], "medical_hold.fresh_checkin_completed")
+            if (
+                hold["status"] == "awaiting_checkin"
+                and hold["ended_at"]
+                and checkin_started_at >= safe_fromisoformat(hold["ended_at"])
+            ):
+                connection.execute(
+                    "UPDATE medical_holds SET status='inactive',updated_at=? WHERE owner_id=?",
+                    (utc_now().isoformat(), user["id"]),
+                )
+                audit(connection, user["id"], "medical_hold.fresh_checkin_completed")
+
+            logger.info("[CHECKIN] check-in saved")
+
         row = connection.execute("SELECT * FROM checkins WHERE id=?", (cursor.lastrowid,)).fetchone()
+
     checkin = dict(row)
     checkin["face_detail"] = face_detail
-    return {
-        "checkin": checkin,
-        "passed": passed,
-        "message": message,
+
+    checks = {
+        "face": statuses.get("face_status", "failed"),
+        "liveness": statuses.get("liveness_status", "failed"),
+        "voice": statuses.get("speech_status", "failed"),
     }
+
+    if passed:
+        return {
+            "success": True,
+            "passed": True,
+            "status": "success",
+            "message": "Check-in verified successfully.",
+            "checks": checks,
+            "checkin": checkin,
+            "checkin_time": now_str,
+            "next_checkin_deadline": next_deadline,
+        }
+    else:
+        return {
+            "success": False,
+            "passed": False,
+            "status": "failed",
+            "message": "Check-in verification failed.",
+            "failure_reason": message,
+            "checks": checks,
+            "checkin": checkin,
+        }
 
 
 @app.get("/api/check-ins")

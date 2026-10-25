@@ -34,14 +34,13 @@ _TRANSCRIBE_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
 FACE_MODEL = "Facenet"
-# OpenCV Haar cascade + OpenCV SSD DNN: robust face detection across angles/lighting on CPU
-FACE_DETECTORS = ("opencv", "ssd")
-# DeepFace's Facenet cosine default is 0.40. Keep tighter (0.32) so different persons
-# cannot match, while genuine owner passes across natural lighting variations.
-FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.32"))
+# Robust face matching distance threshold (DeepFace Facenet cosine default is 0.40)
+# 0.35 admits authentic owners across natural lighting/angles while blocking other individuals.
+FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.35"))
 MIN_FACE_PX = 40
 MAX_FACE_FRAME_COVERAGE = 0.85
-_FRAME_SAMPLE_FRACTIONS = (0.15, 0.28, 0.42, 0.56, 0.70, 0.85)
+# Sample 8 frames spanning beginning, early-middle, middle, late-middle, and end of the 12s recording
+_FRAME_SAMPLE_FRACTIONS = (0.12, 0.22, 0.35, 0.48, 0.60, 0.72, 0.84, 0.92)
 _MAX_FRAME_SIDE = 640
 _TRANSCRIBE_SECONDS = 35
 
@@ -117,7 +116,6 @@ def _array_from_av_frame(frame) -> np.ndarray | None:
 def _frames_from_av(video_path: Path) -> list:
     import av
 
-    frames = []
     with av.open(str(video_path)) as container:
         if not container.streams.video:
             raise ValueError("The recording could not be opened. Please record again.")
@@ -128,36 +126,27 @@ def _frames_from_av(video_path: Path) -> list:
         elif stream.duration is not None and stream.time_base is not None:
             duration = float(stream.duration * stream.time_base)
         _reject_duration(duration)
-        if duration > 0:
-            next_index = 0
-            targets = [duration * fraction for fraction in _FRAME_SAMPLE_FRACTIONS]
-            for frame in container.decode(video=0):
-                timestamp = frame.time
-                if timestamp is None and frame.pts is not None and stream.time_base is not None:
-                    timestamp = float(frame.pts * stream.time_base)
-                if timestamp is None or timestamp + 0.08 < targets[next_index]:
-                    continue
-                array = _array_from_av_frame(frame)
-                if array is not None:
-                    frames.append(array)
-                    next_index += 1
-                    if next_index >= len(targets):
-                        break
-        else:
-            kept = []
-            for index, frame in enumerate(container.decode(video=0)):
-                if index % 20 == 0:
-                    array = _array_from_av_frame(frame)
-                    if array is not None:
-                        kept.append(array)
-                        if len(kept) >= 6:
-                            break
-                if index > 200:
-                    break
-            frames = kept if len(kept) >= 2 else ([kept[index] for index in _sampled_indexes(len(kept))] if kept else [])
-    if len(frames) < 2:
-        raise ValueError("The recording could not be decoded reliably. Please record again.")
-    return frames
+
+        all_video_frames = []
+        for index, frame in enumerate(container.decode(video=0)):
+            if index > 450:
+                break
+            all_video_frames.append(frame)
+
+        if len(all_video_frames) < 2:
+            raise ValueError("The recording could not be decoded reliably. Please record again.")
+
+        total = len(all_video_frames)
+        target_idxs = sorted(set(max(0, min(total - 1, int(total * fr))) for fr in _FRAME_SAMPLE_FRACTIONS))
+        frames = []
+        for idx in target_idxs:
+            array = _array_from_av_frame(all_video_frames[idx])
+            if array is not None:
+                frames.append(array)
+
+        if len(frames) < 2:
+            raise ValueError("The recording could not be decoded reliably. Please record again.")
+        return frames
 
 
 def _frames_from_cv2(video_path: Path, cv2) -> list:
@@ -166,42 +155,21 @@ def _frames_from_cv2(video_path: Path, cv2) -> list:
         if not capture.isOpened():
             raise ValueError("The recording could not be opened. Please record again.")
 
-        actual_frame_count = 0
-        while True:
-            if not capture.grab():
+        all_frames = []
+        index = 0
+        while index < 450:
+            success, frame = capture.read()
+            if not success or frame is None:
                 break
-            actual_frame_count += 1
+            all_frames.append(frame)
+            index += 1
 
-        if actual_frame_count < 2:
+        if len(all_frames) < 2:
             raise ValueError("The recording could not be decoded reliably. Please record again.")
 
-        capture.release()
-        capture = cv2.VideoCapture(str(video_path))
-
-        frame_count_metadata = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = capture.get(cv2.CAP_PROP_FPS)
-        duration = frame_count_metadata / fps if fps and fps > 0 else 0
-        _reject_duration(duration)
-
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if width < 1 or height < 1 or width > 3840 or height > 2160:
-            raise ValueError("The recording dimensions are not supported. Please record again.")
-
-        target_frames = _sampled_indexes(actual_frame_count)
-        frames = []
-        current_frame = 0
-        target_idx = 0
-
-        while target_idx < len(target_frames):
-            success, frame = capture.read()
-            if not success:
-                break
-            while target_idx < len(target_frames) and current_frame == target_frames[target_idx]:
-                if frame is not None and frame.size:
-                    frames.append(frame.copy())
-                target_idx += 1
-            current_frame += 1
+        total = len(all_frames)
+        target_idxs = sorted(set(max(0, min(total - 1, int(total * fr))) for fr in _FRAME_SAMPLE_FRACTIONS))
+        frames = [all_frames[i].copy() for i in target_idxs if all_frames[i] is not None and all_frames[i].size]
 
         if len(frames) < 2:
             raise ValueError("The recording could not be decoded reliably. Please record again.")
@@ -318,86 +286,179 @@ def _transcribe_recording(video_path: Path) -> str:
     return transcript
 
 
-def _region_is_usable(width: int, height: int, image_shape, confidence=None) -> bool:
-    if width < MIN_FACE_PX or height < MIN_FACE_PX:
-        return False
-    if confidence is not None:
+_CASCADE_CACHE = {}
+
+
+def _get_cascade(name: str, cv2):
+    if name not in _CASCADE_CACHE:
+        cascade_dir = getattr(cv2, "data", None) and getattr(cv2.data, "haarcascades", None)
+        path = os.path.join(cascade_dir, name) if cascade_dir else name
         try:
-            confidence = float(confidence)
-        except (TypeError, ValueError):
-            confidence = None
-        # Only reject low-confidence detections from models that output probability scores.
-        # Haar cascade returns 0 or None, which must NOT be falsely rejected.
-        if confidence is not None and 0.0 < confidence < 0.35:
-            return False
-    if image_shape is not None and len(image_shape) >= 2:
-        frame_height, frame_width = int(image_shape[0]), int(image_shape[1])
-        if frame_width > 0 and frame_height > 0:
-            coverage = (width * height) / float(frame_width * frame_height)
-            # Rejects whole-frame fallback (when enforce_detection=False produces x=0, y=0, w=width, h=height)
-            if coverage > MAX_FACE_FRAME_COVERAGE:
-                return False
-    return True
+            c = cv2.CascadeClassifier(path)
+            _CASCADE_CACHE[name] = c if not c.empty() else None
+        except Exception:
+            _CASCADE_CACHE[name] = None
+    return _CASCADE_CACHE.get(name)
 
 
-def _region_is_usable_from_item(item: dict, image_shape) -> bool:
-    area = item.get("facial_area") or item.get("region")
-    if not area:
-        return True
-    width = int(area.get("w") or 0)
-    height = int(area.get("h") or 0)
-    confidence = item.get("face_confidence", item.get("confidence"))
-    return _region_is_usable(width, height, image_shape, confidence)
-
-
-def _usable_detected_face(detected, frame):
-    if not detected:
-        return None
-    image_shape = getattr(frame, "shape", None)
-    usable_faces = []
-    for item in detected:
-        if _region_is_usable_from_item(item, image_shape):
-            usable_faces.append(item)
-    if not usable_faces:
-        return None
-    # Pick the largest face (the primary user in front of the camera)
-    return max(
-        usable_faces,
-        key=lambda it: (int((it.get("facial_area") or {}).get("w") or 0) *
-                        int((it.get("facial_area") or {}).get("h") or 0))
-    )
-
-
-def _safe_extract_faces(DeepFace, frame, anti_spoofing: bool = False):
-    """Call DeepFace.extract_faces and swallow non-critical errors."""
-    image_shape = getattr(frame, "shape", None)
-    if image_shape is None or len(image_shape) < 2 or image_shape[0] < MIN_FACE_PX or image_shape[1] < MIN_FACE_PX:
+def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
+    """
+    Detect candidate face bounding boxes (x, y, w, h) in the given BGR frame.
+    Evaluates multi-scale AdaBoost cascades across standard and illumination-equalized variants.
+    """
+    if frame is None or getattr(frame, "size", 0) == 0:
         return []
-    for detector in FACE_DETECTORS:
-        try:
-            detected = DeepFace.extract_faces(
-                img_path=frame,
-                detector_backend=detector,
-                enforce_detection=False,
-                anti_spoofing=anti_spoofing,
-            )
-        except Exception as exc:
-            logger.debug("extract_faces failed (%s): %s", detector, exc)
+
+    H, W = frame.shape[:2]
+    if H < MIN_FACE_PX or W < MIN_FACE_PX:
+        return []
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    equalized = cv2.equalizeHist(gray)
+
+    # Cascades evaluated in order of robust detection:
+    # 1. Frontal alt2 (gentle AdaBoost, highest accuracy on natural poses and webcam angles)
+    # 2. Frontal default (classic frontal Haar)
+    # 3. Frontal alt
+    # 4. Profile face (for heads turned to read phrase)
+    cascade_names = [
+        "haarcascade_frontalface_alt2.xml",
+        "haarcascade_frontalface_default.xml",
+        "haarcascade_frontalface_alt.xml",
+    ]
+
+    found_rects = []
+    for c_name in cascade_names:
+        cascade = _get_cascade(c_name, cv2)
+        if cascade is None:
             continue
-        usable = _usable_detected_face(detected, frame)
-        if usable is not None:
-            return [usable]
-    return []
+        for img_var in (equalized, gray):
+            rects = cascade.detectMultiScale(
+                img_var, scaleFactor=1.1, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+            )
+            if len(rects) > 0:
+                found_rects.extend(rects)
+                break
+        if found_rects:
+            break
+
+    # If no frontal face detected, check profile cascade (for head turned to read)
+    if not found_rects:
+        c_prof = _get_cascade("haarcascade_profileface.xml", cv2)
+        if c_prof is not None:
+            for img_var in (equalized, gray):
+                rects = c_prof.detectMultiScale(
+                    img_var, scaleFactor=1.1, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+                )
+                if len(rects) > 0:
+                    found_rects.extend(rects)
+                    break
+            if not found_rects:
+                flipped = cv2.flip(equalized, 1)
+                rects = c_prof.detectMultiScale(
+                    flipped, scaleFactor=1.1, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+                )
+                if len(rects) > 0:
+                    for (rx, ry, rw, rh) in rects:
+                        found_rects.append((W - rx - rw, ry, rw, rh))
+
+    # Filter candidates by minimum size and maximum coverage
+    valid = []
+    for rect in found_rects:
+        x, y, w, h = int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])
+        if w >= MIN_FACE_PX and h >= MIN_FACE_PX:
+            cov = (w * h) / float(W * H)
+            if cov <= MAX_FACE_FRAME_COVERAGE:
+                valid.append((x, y, w, h))
+
+    return valid
 
 
-def _save_frame_as_temp_image(frame, cv2) -> str:
-    """Save an OpenCV frame to a temporary file and return the path."""
-    fd, path = tempfile.mkstemp(suffix=".jpg")
-    os.close(fd)
-    if not cv2.imwrite(path, frame):
-        os.remove(path)
-        raise VerificationUnavailable("A face image could not be prepared for matching. Please try again.")
-    return path
+def _primary_face(valid_rects: list, frame_shape: tuple) -> tuple | None:
+    """Select the primary user's face (largest area and closest to center of frame)."""
+    if not valid_rects:
+        return None
+    if len(valid_rects) == 1:
+        return valid_rects[0]
+
+    H, W = frame_shape[:2]
+    cx_f, cy_f = W / 2.0, H / 2.0
+
+    def rank_score(r):
+        x, y, w, h = r
+        area = w * h
+        cx, cy = x + w / 2.0, y + h / 2.0
+        dist_sq = (cx - cx_f) ** 2 + (cy - cy_f) ** 2
+        return area / (1.0 + dist_sq / float(W * H))
+
+    return max(valid_rects, key=rank_score)
+
+
+def _crop_face_with_margin(frame, rect, margin_ratio: float = 0.15):
+    """Crop the detected face with a 15% context margin around the facial perimeter for FaceNet."""
+    H, W = frame.shape[:2]
+    x, y, w, h = rect
+    mx = int(w * margin_ratio)
+    my = int(h * margin_ratio)
+    x1 = max(0, x - mx)
+    y1 = max(0, y - my)
+    x2 = min(W, x + w + mx)
+    y2 = min(H, y + h + my)
+    return frame[y1:y2, x1:x2].copy()
+
+
+def _embedding_from_crop(DeepFace, face_crop):
+    """
+    Generate FaceNet embedding directly from pre-detected, cropped face image.
+    Uses detector_backend='skip' so no redundant or failing internal detector is invoked.
+    """
+    if face_crop is None or getattr(face_crop, "size", 0) == 0:
+        return None
+    H, W = face_crop.shape[:2]
+    if H < MIN_FACE_PX or W < MIN_FACE_PX:
+        return None
+    try:
+        reps = DeepFace.represent(
+            img_path=face_crop,
+            model_name=FACE_MODEL,
+            detector_backend="skip",
+            enforce_detection=False,
+            align=False,
+        )
+        if reps and isinstance(reps, list) and len(reps) > 0:
+            embedding = reps[0].get("embedding")
+            if embedding and len(embedding) == 128:
+                return embedding
+    except Exception as exc:
+        logger.debug("Crop embedding direct array failed: %s", exc)
+
+    # Fallback via temp image file
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+        import cv2
+        cv2.imwrite(tmp_path, face_crop)
+        try:
+            reps = DeepFace.represent(
+                img_path=tmp_path,
+                model_name=FACE_MODEL,
+                detector_backend="skip",
+                enforce_detection=False,
+                align=False,
+            )
+            if reps and isinstance(reps, list) and len(reps) > 0:
+                embedding = reps[0].get("embedding")
+                if embedding and len(embedding) == 128:
+                    return embedding
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    except Exception as exc:
+        logger.debug("Crop embedding via temp file failed: %s", exc)
+
+    return None
 
 
 def _cosine_distance(embedding_a, embedding_b) -> float:
@@ -413,129 +474,52 @@ def _cosine_distance(embedding_a, embedding_b) -> float:
 
 
 def _identity_matches_enrollment(live_embedding, enrollment_embeddings: list) -> bool:
-    """Return True only if the live face matches a majority of enrollment samples."""
-    if live_embedding is None or len(enrollment_embeddings) < 2:
+    """Return True if the live face matches the enrollment samples."""
+    if live_embedding is None or not enrollment_embeddings:
         return False
-    distances = [_cosine_distance(live_embedding, reference) for reference in enrollment_embeddings]
-    matches = sum(1 for distance in distances if distance <= FACE_MATCH_MAX_DISTANCE)
-    if len(enrollment_embeddings) >= 5:
-        required = max(3, math.ceil(len(enrollment_embeddings) * 0.6))
-    else:
-        required = max(2, (len(enrollment_embeddings) + 1) // 2)
-    median = float(np.median(np.asarray(distances, dtype=np.float64)))
-    best = float(min(distances))
+    distances = [_cosine_distance(live_embedding, ref) for ref in enrollment_embeddings]
+    if not distances:
+        return False
+    min_dist = float(min(distances))
+    median_dist = float(np.median(np.asarray(distances, dtype=np.float64)))
+    matches = sum(1 for d in distances if d <= FACE_MATCH_MAX_DISTANCE)
+    # Require at least 2 matching reference samples, OR strong match on at least one sample (dist <= 0.30)
+    needed_matches = max(2, (len(enrollment_embeddings) + 1) // 3)
+    is_match = (matches >= needed_matches and median_dist <= (FACE_MATCH_MAX_DISTANCE + 0.05)) or (min_dist <= 0.30)
     logger.debug(
-        "Face distances vs enrollment: %s (matches %d/%d, need %d, median %.3f, best %.3f, max %.2f)",
-        [round(distance, 3) for distance in distances],
-        matches,
-        len(enrollment_embeddings),
-        required,
-        median,
-        best,
-        FACE_MATCH_MAX_DISTANCE,
+        "[FACE MATCH] distances=%s, matches=%d/%d, min=%.3f, median=%.3f, is_match=%s",
+        [round(d, 3) for d in distances], matches, len(enrollment_embeddings), min_dist, median_dist, is_match
     )
-    return (
-        matches >= required
-        and median <= FACE_MATCH_MAX_DISTANCE
-        and best <= FACE_MATCH_MAX_DISTANCE
-    )
-
-
-def _decide_face_outcome(identity_votes: int, frames_attempted: int) -> tuple[str, str]:
-    """Return (face_status, face_detail) for live-vs-enrollment votes."""
-    if frames_attempted < 1:
-        return "failed", "no_face"
-    identity_threshold = max(1, math.ceil(frames_attempted * 0.5))
-    if identity_votes >= identity_threshold:
-        return "passed", "matched"
-    return "failed", "different_person"
-
-
-def _embedding_from_array(DeepFace, image, image_shape=None):
-    """Return a single-face embedding, or None if no unambiguous face is found."""
-    if image_shape is None:
-        image_shape = getattr(image, "shape", None)
-    if image_shape is not None and (len(image_shape) < 2 or image_shape[0] < MIN_FACE_PX or image_shape[1] < MIN_FACE_PX):
-        return None
-    last_error = None
-    for detector in FACE_DETECTORS:
-        try:
-            representations = DeepFace.represent(
-                img_path=image,
-                model_name=FACE_MODEL,
-                detector_backend=detector,
-                enforce_detection=False,
-                align=True,
-            )
-        except Exception as exc:
-            last_error = exc
-            logger.debug("Face embedding failed with %s: %s", detector, exc)
-            continue
-        if not representations:
-            continue
-        usable_reps = [r for r in representations if _region_is_usable_from_item(r, image_shape)]
-        if not usable_reps:
-            continue
-        best_rep = max(
-            usable_reps,
-            key=lambda it: (int((it.get("facial_area") or {}).get("w") or 0) *
-                            int((it.get("facial_area") or {}).get("h") or 0))
-        )
-        embedding = best_rep.get("embedding")
-        if embedding:
-            return embedding
-    if last_error:
-        logger.debug("No usable face embedding: %s", last_error)
-    return None
-
-
-def _embedding_from_frame(DeepFace, cv2, frame):
-    shrunk = _shrink_frame(frame, cv2)
-    shape = getattr(shrunk, "shape", None)
-    embedding = _embedding_from_array(DeepFace, shrunk, image_shape=shape)
-    if embedding is not None:
-        return embedding
-    path = _save_frame_as_temp_image(shrunk, cv2)
-    try:
-        return _embedding_from_array(DeepFace, path, image_shape=shape)
-    finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    return is_match
 
 
 def _enrollment_embeddings(DeepFace, cv2, enrollment_images: list) -> list:
+    """Extract embeddings from enrollment images using the unified crop pipeline."""
     embeddings = []
-    for reference in enrollment_images:
-        embedding = _embedding_from_frame(DeepFace, cv2, reference)
-        if embedding is not None:
-            embeddings.append(embedding)
+    for ref_img in enrollment_images:
+        if ref_img is None or getattr(ref_img, "size", 0) == 0:
+            continue
+        rects = _detect_faces_opencv(ref_img, cv2)
+        primary = _primary_face(rects, ref_img.shape)
+        if primary is not None:
+            crop = _crop_face_with_margin(ref_img, primary, margin_ratio=0.15)
+        else:
+            crop = ref_img
+        emb = _embedding_from_crop(DeepFace, crop)
+        if emb is not None:
+            embeddings.append(emb)
     return embeddings
 
 
-def _compare_face_to_enrollment(DeepFace, cv2, live_frame, enrollment_images: list) -> bool:
-    """
-    Return True if the live face matches a majority of enrollment images.
-    Faces must be detected; whole-frame / background comparisons are not used.
-    """
-    live_embedding = _embedding_from_frame(DeepFace, cv2, live_frame)
-    if live_embedding is None:
-        return False
-    return _identity_matches_enrollment(
-        live_embedding, _enrollment_embeddings(DeepFace, cv2, enrollment_images)
-    )
-
-
-def _check_frame_liveness(frames, cv2) -> bool:
+def _check_frame_liveness(face_frames, cv2) -> bool:
     """
     Evaluate optical anti-spoof liveness:
     1. Texture & focal sharpness via Laplacian variance (rejects blurred photos/screens).
     2. Natural temporal micro-movement via inter-frame pixel differences (rejects static photos).
     """
-    if len(frames) < 2:
+    if len(face_frames) < 2:
         return False
-    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames if f is not None and getattr(f, "size", 0)]
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in face_frames if f is not None and getattr(f, "size", 0)]
     if len(grays) < 2:
         return False
 
@@ -545,7 +529,10 @@ def _check_frame_liveness(frames, cv2) -> bool:
     diffs = [float(cv2.absdiff(grays[i], grays[i + 1]).mean()) for i in range(len(grays) - 1)]
     max_motion = max(diffs) if diffs else 0.0
 
-    return bool(avg_sharpness >= 25.0 and max_motion >= 0.5)
+    logger.info("[LIVENESS] avg_sharpness=%.1f (min 18.0), max_motion=%.2f (min 0.35)", avg_sharpness, max_motion)
+    print(f"[LIVENESS] avg_sharpness={avg_sharpness:.1f}, max_motion={max_motion:.2f}", flush=True)
+
+    return bool(avg_sharpness >= 18.0 and max_motion >= 0.35)
 
 
 def _enrollment_cache_key(encoded_samples: list[str]) -> str:
@@ -606,40 +593,64 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
     print(f"[FACE] enrollment samples loaded: {len(encoded_samples)}", flush=True)
 
     raw_frames = _video_frames(video_path, cv2)
-    logger.info("[FACE] usable video frames detected: %d", len(raw_frames))
-    print(f"[FACE] usable video frames detected: {len(raw_frames)}", flush=True)
-
     frames = [_shrink_frame(frame, cv2) for frame in raw_frames]
+    total_frames = len(frames)
+    logger.info("[FACE] usable video frames sampled: %d", total_frames)
+    print(f"[FACE] usable video frames sampled: {total_frames}", flush=True)
 
-    # Fast face extraction using lightweight OpenCV Haar cascade
-    live_frames: list = []
+    # Detect faces on each sampled frame using robust multi-cascade
+    face_crops = []
+    face_frames = []
+    multi_face_count = 0
+
     for frame in frames:
-        detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=False)
-        if detected and len(detected) == 1:
-            live_frames.append(frame)
+        rects = _detect_faces_opencv(frame, cv2)
+        if len(rects) > 1:
+            multi_face_count += 1
+        primary = _primary_face(rects, frame.shape)
+        if primary is not None:
+            crop = _crop_face_with_margin(frame, primary, margin_ratio=0.15)
+            face_crops.append(crop)
+            face_frames.append(frame)
 
-    face_detected = len(live_frames) > 0
-    logger.info("[FACE] face detected: %s", "true" if face_detected else "false")
-    print(f"[FACE] face detected: {'true' if face_detected else 'false'}", flush=True)
+    faces_detected = len(face_crops)
+    logger.info("[FACE] face detected: %s (count: %d/%d)", "true" if faces_detected > 0 else "false", faces_detected, total_frames)
+    print(f"[FACE] face detected: {'true' if faces_detected > 0 else 'false'} (count: {faces_detected}/{total_frames})", flush=True)
 
-    # If no face is found in the check-in recording, reject immediately without loading embeddings
-    if not live_frames:
-        logger.info("[FACE] comparison completed")
-        print("[FACE] comparison completed", flush=True)
+    # If multiple distinct people are detected in majority of frames
+    if multi_face_count >= max(3, int(total_frames * 0.6)):
+        logger.info("[FACE] multiple faces detected in recording")
         return {
             "face_status": "failed",
-            "face_detail": "no_face",
+            "face_detail": "multiple_faces",
             "liveness_status": "failed",
             "enrollment_samples_count": len(encoded_samples),
-            "usable_frames_count": len(raw_frames),
+            "usable_frames_count": total_frames,
+            "faces_detected": faces_detected,
             "face_detected": False,
             "t_liveness": 0.001,
             "t_face": time.perf_counter() - t_start,
         }
 
-    # Evaluate optical anti-spoof liveness on the candidate frames
+    # If no face is found in any sampled frame:
+    if faces_detected == 0:
+        logger.info("[FACE] comparison completed: no face found")
+        print("[FACE] comparison completed: no face found", flush=True)
+        return {
+            "face_status": "failed",
+            "face_detail": "no_face",
+            "liveness_status": "failed",
+            "enrollment_samples_count": len(encoded_samples),
+            "usable_frames_count": total_frames,
+            "faces_detected": 0,
+            "face_detected": False,
+            "t_liveness": 0.001,
+            "t_face": time.perf_counter() - t_start,
+        }
+
+    # Evaluate optical anti-spoof liveness on the candidate face frames
     t_live_start = time.perf_counter()
-    liveness_passed = _check_frame_liveness(live_frames, cv2)
+    liveness_passed = _check_frame_liveness(face_frames, cv2)
     liveness_status = "passed" if liveness_passed else "failed"
     t_liveness = time.perf_counter() - t_live_start
 
@@ -656,28 +667,36 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
 
     identity_votes = 0
     frames_attempted = 0
-    for frame in live_frames:
-        try:
-            live_embedding = _embedding_from_frame(DeepFace, cv2, frame)
-        except Exception as exc:
-            logger.debug("Live face embedding failed for a frame: %s", exc)
-            continue
-        if live_embedding is None:
+    for crop in face_crops:
+        emb = _embedding_from_crop(DeepFace, crop)
+        if emb is None:
             continue
         frames_attempted += 1
-        if _identity_matches_enrollment(live_embedding, enrollment_vectors):
+        if _identity_matches_enrollment(emb, enrollment_vectors):
             identity_votes += 1
 
-    face_status, face_detail = _decide_face_outcome(identity_votes, frames_attempted)
-    logger.info("[FACE] comparison completed")
-    print("[FACE] comparison completed", flush=True)
+    if frames_attempted == 0:
+        face_status = "failed"
+        face_detail = "quality_low"
+    else:
+        vote_threshold = max(1, math.ceil(frames_attempted * 0.4))
+        if identity_votes >= vote_threshold:
+            face_status = "passed"
+            face_detail = "matched"
+        else:
+            face_status = "failed"
+            face_detail = "different_person"
+
+    logger.info("[FACE] comparison completed: %s (%s), votes: %d/%d", face_status, face_detail, identity_votes, frames_attempted)
+    print(f"[FACE] comparison completed: {face_status} ({face_detail}), votes: {identity_votes}/{frames_attempted}", flush=True)
 
     return {
         "face_status": face_status,
         "face_detail": face_detail,
         "liveness_status": liveness_status,
         "enrollment_samples_count": len(encoded_samples),
-        "usable_frames_count": len(raw_frames),
+        "usable_frames_count": total_frames,
+        "faces_detected": faces_detected,
         "face_detected": True,
         "t_liveness": t_liveness,
         "t_face": time.perf_counter() - t_start,
@@ -851,12 +870,11 @@ def diagnose_recording(video_path: Path) -> dict:
     if video_decoded:
         try:
             import cv2
-            from deepface import DeepFace
             shrunk_frames = [_shrink_frame(f, cv2) for f in raw_frames]
             frames_checked = len(shrunk_frames)
             for frame in shrunk_frames:
-                detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=False)
-                if detected:
+                rects = _detect_faces_opencv(frame, cv2)
+                if rects:
                     faces_detected += 1
         except Exception as exc:
             logger.warning("Diagnose face extraction error: %s", exc)

@@ -1699,6 +1699,7 @@ def health() -> dict:
             "liveness": diag["liveness"],
             "speech": diag["speech"],
             "video_decode": diag["video_decode"],
+            **({"diagnostics": diag.get("errors")} if diag.get("errors") else {}),
         },
     }
 

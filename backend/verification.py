@@ -4,10 +4,20 @@ import logging
 import math
 import os
 import re
+import sys
 import threading
 import tempfile
 from functools import lru_cache
 from pathlib import Path
+
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["PYTHONUTF8"] = "1"
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 import numpy as np
 
@@ -31,33 +41,76 @@ class VerificationUnavailable(RuntimeError):
     pass
 
 
-def verification_diagnostics() -> dict[str, bool]:
+def verification_diagnostics() -> dict:
     """Inspect availability of individual verification subsystems."""
-    from importlib.util import find_spec
-
     engine = os.getenv(
         "DEEPFACE_BACKEND_ENGINE",
         os.getenv("CLOUDGUARD_DEEPFACE_ENGINE", "tensorflow"),
     ).lower()
     engine_module = {"tensorflow": "tensorflow", "pytorch": "torch"}.get(engine)
-    has_engine = engine_module is not None and find_spec(engine_module) is not None
-    has_cv2 = find_spec("cv2") is not None
-    has_deepface = find_spec("deepface") is not None
-    has_tf_keras = find_spec("tf_keras") is not None
-    has_whisper = find_spec("faster_whisper") is not None
-    has_av = find_spec("av") is not None
+
+    has_engine = False
+    has_cv2 = False
+    has_deepface = False
+    has_tf_keras = False
+    has_whisper = False
+    has_av = False
+    err_detail = {}
+
+    try:
+        import av
+        has_av = True
+    except Exception as exc:
+        err_detail["av"] = str(exc)
+
+    try:
+        import cv2
+        has_cv2 = True
+    except Exception as exc:
+        err_detail["cv2"] = str(exc)
+
+    try:
+        import faster_whisper
+        has_whisper = True
+    except Exception as exc:
+        err_detail["faster_whisper"] = str(exc)
+
+    try:
+        import tf_keras
+        has_tf_keras = True
+    except Exception as exc:
+        err_detail["tf_keras"] = str(exc)
+
+    try:
+        if engine_module == "tensorflow":
+            import tensorflow
+            has_engine = True
+        elif engine_module == "torch":
+            import torch
+            has_engine = True
+    except Exception as exc:
+        err_detail["engine"] = str(exc)
+
+    try:
+        from deepface import DeepFace
+        has_deepface = True
+    except Exception as exc:
+        err_detail["deepface"] = str(exc)
 
     face_ready = bool(has_cv2 and has_deepface and has_tf_keras and has_engine)
     liveness_ready = bool(face_ready)
     speech_ready = bool(has_whisper)
     video_ready = bool(has_av or has_cv2)
 
-    return {
+    res = {
         "face": face_ready,
         "liveness": liveness_ready,
         "speech": speech_ready,
         "video_decode": video_ready,
     }
+    if err_detail:
+        res["errors"] = err_detail
+    return res
 
 
 def providers_available() -> bool:
@@ -509,9 +562,10 @@ def verify_recording(
         try:
             import cv2
             from deepface import DeepFace
-        except ImportError as error:
+        except Exception as error:
+            logger.exception("Importing cv2 or DeepFace failed")
             raise VerificationUnavailable(
-                "Local verification models are unavailable. Install the AI requirements and restart the API."
+                f"Local verification models are unavailable: {error}"
             ) from error
 
         frames = [_shrink_frame(frame, cv2) for frame in _video_frames(video_path, cv2)]

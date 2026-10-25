@@ -7,6 +7,16 @@ import logging
 import os
 import re
 import secrets
+import sys
+
+os.environ["PYTHONIOENCODING"] = "utf-8"
+os.environ["PYTHONUTF8"] = "1"
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 import psycopg2
 from psycopg2.extras import DictCursor
 from psycopg2 import errors as pg_errors

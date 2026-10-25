@@ -2859,6 +2859,7 @@ function Checkin({ token, onComplete, onNavigate }) {
     setError('')
     setVerificationResult(null)
     setState('permission_request')
+    console.log('[CHECKIN] requesting camera + microphone')
     if (!navigator.mediaDevices?.getUserMedia) {
       setError('Camera and microphone access require a secure browser context (HTTPS or localhost).')
       setState('idle')
@@ -2871,13 +2872,19 @@ function Checkin({ token, onComplete, onNavigate }) {
       })
       const videoTracks = stream.getVideoTracks()
       const audioTracks = stream.getAudioTracks()
+
+      console.log('[CHECKIN] camera permission granted')
+      console.log('[CHECKIN] microphone permission granted')
+      console.log(`[CHECKIN] video tracks: ${videoTracks.length}`)
+      console.log(`[CHECKIN] audio tracks: ${audioTracks.length}`)
+
       if (videoTracks.length === 0 || videoTracks[0].readyState !== 'live') {
         stream.getTracks().forEach((t) => t.stop())
-        throw new Error('Camera access is required for face matching and liveness verification.')
+        throw new Error('Camera access is required for live verification.')
       }
       if (audioTracks.length === 0 || audioTracks[0].readyState !== 'live') {
         stream.getTracks().forEach((t) => t.stop())
-        throw new Error('Microphone access is required for spoken phrase verification.')
+        throw new Error('Microphone access is required because CloudGuard must verify your spoken phrase.')
       }
 
       streamRef.current = stream
@@ -2900,7 +2907,7 @@ function Checkin({ token, onComplete, onNavigate }) {
       }
       setState('ready')
     } catch (permError) {
-      console.error('Check-in permission error:', permError)
+      console.error('[CHECKIN] permission error:', permError)
       let camOk = false
       let micOk = false
       try {
@@ -2915,9 +2922,9 @@ function Checkin({ token, onComplete, onNavigate }) {
       } catch {}
 
       if (!camOk && micOk) {
-        setError('Camera access is required for face matching and liveness verification. Please allow camera access in your browser.')
+        setError('Camera access is required for live verification.')
       } else if (camOk && !micOk) {
-        setError('Microphone access is required for spoken phrase verification. Please allow microphone access in your browser.')
+        setError('Microphone access is required because CloudGuard must verify your spoken phrase.')
       } else {
         setError(permError.message && !permError.message.includes('object')
           ? permError.message
@@ -2959,8 +2966,10 @@ function Checkin({ token, onComplete, onNavigate }) {
         if (event.data && event.data.size > 0) recordingChunks.current.push(event.data)
       }
       recorder.onstop = () => {
+        console.log('[CHECKIN] recording stopped')
         const clip = new Blob(recordingChunks.current, { type: recorder.mimeType || 'video/webm' })
         recordingClip.current = clip
+        console.log(`[CHECKIN] blob size: ${clip.size}`)
         if (clip.size > 0) {
           setHasClip(true)
           setState('recorded')
@@ -2971,6 +2980,7 @@ function Checkin({ token, onComplete, onNavigate }) {
         }
       }
       recorder.start(500)
+      console.log('[CHECKIN] recording started')
       setSeconds(12)
       setState('recording')
       timerRef.current = window.setInterval(() => setSeconds((remaining) => {
@@ -2984,7 +2994,7 @@ function Checkin({ token, onComplete, onNavigate }) {
         return remaining - 1
       }), 1000)
     } catch (recErr) {
-      console.error('Failed to start MediaRecorder:', recErr)
+      console.error('[CHECKIN] Failed to start MediaRecorder:', recErr)
       setError('This browser could not start a recording. Check camera permissions and try again.')
       setState('ready')
     }
@@ -3040,6 +3050,7 @@ function Checkin({ token, onComplete, onNavigate }) {
       if (!clip || !clip.size) {
         throw new Error('No check-in recording is available. Please record again.')
       }
+      console.log('[CHECKIN] submitting recording')
       const form = new FormData()
       form.append('sentence', sentence)
       form.append('recording', clip, `check-in.${clip.type.includes('mp4') ? 'mp4' : 'webm'}`)
@@ -3086,6 +3097,7 @@ function Checkin({ token, onComplete, onNavigate }) {
       const jobId = jobResponse.job_id
 
       if (jobId) {
+        console.log(`[CHECKIN] job created: ${jobId}`)
         setState('processing')
         // Poll for job completion: max 60 attempts * 2000ms = 120 seconds
         const pollStartTime = Date.now()
@@ -3093,10 +3105,12 @@ function Checkin({ token, onComplete, onNavigate }) {
         while (Date.now() - pollStartTime < maxWaitMs) {
           await new Promise((resolve) => setTimeout(resolve, 2000))
           try {
+            console.log(`[CHECKIN] polling job: ${jobId}`)
             const statusRes = await api(`/check-ins/status/${jobId}`, {
               token,
               timeoutMs: 15000,
             })
+            console.log(`[CHECKIN] job status: ${statusRes.status}`)
             if (statusRes.status !== 'processing') {
               response = statusRes
               break
@@ -3338,7 +3352,7 @@ function Checkin({ token, onComplete, onNavigate }) {
                 onClick={saveCheckin}
                 disabled={!hasClip}
               >
-                Verify check-in <Icon name="arrow" size={17} />
+                Verify check-in →
               </button>
               <button
                 className="button button-quiet"
@@ -3354,7 +3368,7 @@ function Checkin({ token, onComplete, onNavigate }) {
           <div className="recording-panel">
             <span className="recording-pulse" style={{ background: '#6366f1', boxShadow: '0 0 0 6px #e0e7ff' }} />
             <b style={{ fontSize: '15px' }}>Analyzing face, liveness & voice...</b>
-            <small>Verification in progress. The server is analyzing face matching, anti-spoof liveness, and voice phrase.</small>
+            <small>Your recording has been securely submitted. This may take up to a minute.</small>
             <div className="result-checks" style={{ marginTop: '14px', width: '100%', maxWidth: '370px' }}>
               <div><span>Face matching</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>
               <div><span>Anti-spoof liveness</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>

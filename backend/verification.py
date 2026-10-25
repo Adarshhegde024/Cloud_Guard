@@ -546,20 +546,26 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
 
 def _run_speech_subprocess(video_path: Path) -> str:
     """Run speech transcription in an isolated process to reclaim all memory upon completion."""
+    file_dir = str(Path(__file__).resolve().parent).replace("\\", "/")
+    root_dir = str(Path(__file__).resolve().parent.parent).replace("\\", "/")
     script = (
         "import sys, os\n"
         "os.environ['PYTHONIOENCODING'] = 'utf-8'\n"
         "os.environ['PYTHONUTF8'] = '1'\n"
+        f"for d in ('{file_dir}', '{root_dir}'):\n"
+        "    if d not in sys.path: sys.path.insert(0, d)\n"
         "from pathlib import Path\n"
-        "from backend.verification import _transcribe_recording\n"
+        "try:\n"
+        "    from verification import _transcribe_recording\n"
+        "except ImportError:\n"
+        "    from backend.verification import _transcribe_recording\n"
         f"t = _transcribe_recording(Path(r'{str(video_path).replace(chr(92), '/')}'))\n"
-        "print('__TRANSCRIPT__:' + t)\n"
+        "print('__TRANSCRIPT__:' + (t or ''))\n"
     )
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
-    backend_root = str(Path(__file__).resolve().parent.parent)
-    env["PYTHONPATH"] = backend_root
+    env["PYTHONPATH"] = f"{file_dir}{os.pathsep}{root_dir}"
     try:
         proc = subprocess.run(
             [sys.executable, "-c", script],
@@ -568,20 +574,22 @@ def _run_speech_subprocess(video_path: Path) -> str:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=45,
+            timeout=50,
         )
         for line in proc.stdout.splitlines():
             if line.startswith("__TRANSCRIPT__:"):
                 return line.split("__TRANSCRIPT__:", 1)[1].strip()
         logger.warning("Speech worker output: %s (err: %s)", proc.stdout, proc.stderr)
     except Exception as exc:
-        logger.warning("Speech worker failed: %s; falling back to in-process", exc)
-        return _transcribe_recording(video_path)
+        logger.warning("Speech worker failed: %s", exc)
     return ""
 
 
 def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
     """Run face evaluation in an isolated process to reclaim all memory upon completion."""
+    file_dir = str(Path(__file__).resolve().parent).replace("\\", "/")
+    root_dir = str(Path(__file__).resolve().parent.parent).replace("\\", "/")
+
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
         json.dump(encoded_samples, f)
         samples_file = f.name
@@ -594,8 +602,13 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
         "os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'\n"
         "if hasattr(sys.stdout, 'reconfigure'):\n"
         "    sys.stdout.reconfigure(encoding='utf-8')\n"
+        f"for d in ('{file_dir}', '{root_dir}'):\n"
+        "    if d not in sys.path: sys.path.insert(0, d)\n"
         "from pathlib import Path\n"
-        "from backend.verification import _evaluate_face_and_liveness\n"
+        "try:\n"
+        "    from verification import _evaluate_face_and_liveness\n"
+        "except ImportError:\n"
+        "    from backend.verification import _evaluate_face_and_liveness\n"
         f"with open(r'{samples_file.replace(chr(92), '/')}', 'r', encoding='utf-8') as f:\n"
         "    samples = json.load(f)\n"
         f"res = _evaluate_face_and_liveness(Path(r'{str(video_path).replace(chr(92), '/')}'), samples)\n"
@@ -606,8 +619,7 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
     env["PYTHONUTF8"] = "1"
     env["TF_CPP_MIN_LOG_LEVEL"] = "3"
     env["TF_ENABLE_ONEDNN_OPTS"] = "0"
-    backend_root = str(Path(__file__).resolve().parent.parent)
-    env["PYTHONPATH"] = backend_root
+    env["PYTHONPATH"] = f"{file_dir}{os.pathsep}{root_dir}"
     try:
         proc = subprocess.run(
             [sys.executable, "-c", script],
@@ -616,15 +628,14 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=55,
+            timeout=85,
         )
         for line in proc.stdout.splitlines():
             if line.startswith("__FACE_RESULT__:"):
                 return json.loads(line.split("__FACE_RESULT__:", 1)[1].strip())
         logger.warning("Face worker output: %s (err: %s)", proc.stdout, proc.stderr)
     except Exception as exc:
-        logger.warning("Face worker failed: %s; falling back to in-process", exc)
-        return _evaluate_face_and_liveness(video_path, encoded_samples)
+        logger.warning("Face worker error: %s", exc)
     finally:
         try:
             os.remove(samples_file)

@@ -2925,16 +2925,75 @@ function Checkin({ token, onComplete, onNavigate }) {
       form.append('sentence', sentence)
       form.append('recording', clip, `check-in.${clip.type.includes('mp4') ? 'mp4' : 'webm'}`)
 
-      // 90-second client timeout ensures the UI is never permanently stuck in 'submitting'
-      const response = await api('/check-ins', {
-        token,
-        method: 'POST',
-        body: form,
-        timeoutMs: 90000,
-      })
+      // 1. Submit recording to start asynchronous verification job
+      let jobResponse
+      try {
+        jobResponse = await api('/check-ins/start', {
+          token,
+          method: 'POST',
+          body: form,
+          timeoutMs: 30000,
+        })
+      } catch (startErr) {
+        // Fallback to /check-ins?async_mode=true if /check-ins/start is not found
+        if (startErr.status === 404) {
+          jobResponse = await api('/check-ins?async_mode=true', {
+            token,
+            method: 'POST',
+            body: form,
+            timeoutMs: 30000,
+          })
+        } else {
+          throw startErr
+        }
+      }
 
-      if (!response) {
+      if (!jobResponse) {
         throw new Error('No response received from verification server.')
+      }
+
+      // If server returned direct unavailable response (e.g. providers not ready)
+      if (jobResponse.status === 'verification_unavailable' || jobResponse.verification_unavailable || jobResponse.checks?.face === 'unavailable') {
+        setState('unavailable')
+        setVerificationResult({
+          status: 'unavailable',
+          message: jobResponse.message || 'Live verification services are temporarily unavailable.',
+          checks: { face: 'unavailable', liveness: 'unavailable', voice: 'unavailable' },
+        })
+        return
+      }
+
+      let response = null
+      const jobId = jobResponse.job_id
+
+      if (jobId) {
+        // Poll for job completion: max 60 attempts * 2000ms = 120 seconds
+        const pollStartTime = Date.now()
+        const maxWaitMs = 120000
+        while (Date.now() - pollStartTime < maxWaitMs) {
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+          try {
+            const statusRes = await api(`/check-ins/status/${jobId}`, {
+              token,
+              timeoutMs: 15000,
+            })
+            if (statusRes.status !== 'processing') {
+              response = statusRes
+              break
+            }
+          } catch (pollErr) {
+            if (pollErr.status === 401 || pollErr.status === 404) {
+              throw pollErr
+            }
+            console.warn('Transient check-in poll error, retrying...', pollErr.message)
+          }
+        }
+        if (!response) {
+          throw new Error('Verification is taking too long. Please try again.')
+        }
+      } else {
+        // Direct response fallback
+        response = jobResponse
       }
 
       if (response.status === 'verification_unavailable' || response.verification_unavailable || response.checks?.face === 'unavailable') {
@@ -2988,11 +3047,18 @@ function Checkin({ token, onComplete, onNavigate }) {
     } catch (requestError) {
       const errData = requestError.data || {}
       const status = requestError.status
-      if (errData.status === 'verification_unavailable' || errData.verification_unavailable || status === 503) {
+      const isUnavailable =
+        status === 502 || status === 503 || status === 504 ||
+        errData.status === 'verification_unavailable' ||
+        errData.verification_unavailable ||
+        requestError.message?.includes('unreachable') ||
+        requestError.message?.includes('Failed to fetch')
+
+      if (isUnavailable) {
         setState('unavailable')
         setVerificationResult({
           status: 'unavailable',
-          message: errData.message || 'Live verification services are temporarily unavailable.',
+          message: errData.message || 'Verification service is temporarily unavailable. No check-in was recorded. Please try again.',
           checks: { face: 'unavailable', liveness: 'unavailable', voice: 'unavailable' },
         })
       } else {

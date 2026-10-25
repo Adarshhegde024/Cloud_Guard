@@ -22,7 +22,9 @@ from psycopg2.extras import DictCursor
 from psycopg2 import errors as pg_errors
 from psycopg2 import IntegrityError as PGIntegrityError
 import tempfile
+import threading
 import time
+import uuid
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -3701,116 +3703,33 @@ def diagnose_checkin(
     return result
 
 
-@app.post("/api/check-ins", status_code=201)
-def create_checkin(
-    sentence: str = Form(..., min_length=5, max_length=250),
-    recording: UploadFile = File(...),
-    user: dict = Depends(current_user),
-):
-    t_start = time.perf_counter()
-    logger.info("[CHECKIN] Request received")
-    logger.info("[CHECKIN] Authentication verified")
-    logger.info("[CHECKIN] authenticated owner: %s", user["id"])
-    if sentence not in CHECKIN_SENTENCES:
-        logger.warning("[CHECKIN ERROR] The check-in phrase is not valid.")
-        raise HTTPException(status_code=422, detail="The check-in phrase is not valid. Start a new check-in and try again.")
-    if not providers_available():
-        logger.warning("[CHECKIN ERROR] Live verification dependencies are unavailable")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "success": False,
-                "checkin_saved": False,
-                "verification_unavailable": True,
-                "status": "verification_unavailable",
-                "message": "Live verification services are temporarily unavailable.",
-                "checks": {
-                    "face": "unavailable",
-                    "liveness": "unavailable",
-                    "voice": "unavailable",
-                },
-            },
-        )
-    suffix = Path(recording.filename or "").suffix.lower()
-    if suffix not in {".webm", ".mp4", ".mov"}:
-        logger.warning("[CHECKIN ERROR] Unsupported recording format: %s", suffix)
-        raise HTTPException(status_code=415, detail="Record a WebM or MP4 check-in clip.")
-    data = recording.file.read(MAX_CHECKIN_BYTES + 1)
-    if not data:
-        logger.warning("[CHECKIN ERROR] The check-in recording is empty.")
-        raise HTTPException(status_code=400, detail="The check-in recording is empty.")
-    if len(data) > MAX_CHECKIN_BYTES:
-        logger.warning("[CHECKIN ERROR] Recording exceeds 20MB limit")
-        raise HTTPException(status_code=413, detail="Check-in recordings must be 20 MB or smaller.")
-    
-    content_type = recording.content_type or "unknown"
-    logger.info("[CHECKIN] Recording received: filename=%s, content_type=%s, size=%d bytes", recording.filename, content_type, len(data))
-    print(f"[CHECKIN] Recording received: filename={recording.filename}, content_type={content_type}, size={len(data)} bytes", flush=True)
+# --- Check-in Asynchronous Jobs Store ---
+_CHECKIN_JOBS = {}
+_CHECKIN_JOBS_LOCK = threading.Lock()
+_JOB_EXPIRY_SECONDS = 900  # 15 minutes
 
-    with db() as connection:
-        owner = connection.execute(
-            "SELECT face_enrollment FROM users WHERE id=?", (user["id"],)
-        ).fetchone()
-    if owner is None or owner["face_enrollment"] is None:
-        logger.warning("[CHECKIN ERROR] Face enrollment is missing for owner id=%s", user["id"])
-        raise HTTPException(status_code=409, detail="Face enrollment is missing. Re-enroll your face before checking in.")
-    try:
-        enrollment_samples = json.loads(decrypt_bytes(owner["face_enrollment"]))
-    except (ValueError, TypeError) as error:
-        logger.warning("[CHECKIN ERROR] Face enrollment data could not be decrypted")
-        raise HTTPException(status_code=409, detail="Face enrollment data could not be read. Please contact support.") from error
-    
+
+def _cleanup_old_checkin_jobs():
+    cutoff = time.time() - _JOB_EXPIRY_SECONDS
+    with _CHECKIN_JOBS_LOCK:
+        expired = [jid for jid, info in _CHECKIN_JOBS.items() if info.get("created_at", 0) < cutoff]
+        for jid in expired:
+            _CHECKIN_JOBS.pop(jid, None)
+
+
+def _process_verification_and_db(
+    user: dict,
+    video_path: Path,
+    enrollment_samples: list,
+    sentence: str,
+    t_start: float,
+) -> dict:
     checkin_started_at = utc_now()
-    with tempfile.TemporaryDirectory(prefix="cloudguard-checkin-") as directory:
-        video_path = Path(directory) / f"recording{suffix}"
-        video_path.write_bytes(data)
-        logger.info("[CHECKIN] Temporary file created")
-        t_upload = time.perf_counter() - t_start
-        try:
-            statuses = verify_recording(video_path, enrollment_samples, sentence)
-            required = {"face_status", "liveness_status", "speech_status"}
-            if not isinstance(statuses, dict) or not required.issubset(statuses):
-                raise VerificationUnavailable("Local verification produced an incomplete result.")
-            logger.info("[CHECKIN] All verification checks completed")
-        except ValueError as error:
-            logger.warning("[CHECKIN ERROR] %s", error)
-            raise HTTPException(status_code=422, detail=str(error)) from error
-        except VerificationUnavailable as error:
-            logger.warning("[CHECKIN ERROR] %s", error)
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "success": False,
-                    "checkin_saved": False,
-                    "verification_unavailable": True,
-                    "status": "verification_unavailable",
-                    "message": str(error) or "Live verification services are temporarily unavailable.",
-                    "checks": {
-                        "face": "unavailable",
-                        "liveness": "unavailable",
-                        "voice": "unavailable",
-                    },
-                },
-            )
-        except Exception as error:
-            logger.exception("[CHECKIN ERROR] Local check-in verification failed unexpectedly.")
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "success": False,
-                    "checkin_saved": False,
-                    "verification_unavailable": True,
-                    "status": "verification_unavailable",
-                    "message": "Local verification could not complete. No result was saved; check the API log and try again.",
-                    "checks": {
-                        "face": "unavailable",
-                        "liveness": "unavailable",
-                        "voice": "unavailable",
-                    },
-                },
-            )
-        finally:
-            logger.info("[CHECKIN] Temporary recording deleted")
+    statuses = verify_recording(video_path, enrollment_samples, sentence)
+    required = {"face_status", "liveness_status", "speech_status"}
+    if not isinstance(statuses, dict) or not required.issubset(statuses):
+        raise VerificationUnavailable("Local verification produced an incomplete result.")
+    logger.info("[CHECKIN] All verification checks completed")
 
     passed = all(statuses.get(check) == "passed" for check in ("face_status", "liveness_status", "speech_status"))
     checkin_status = "success" if passed else "failed"
@@ -3913,10 +3832,9 @@ def create_checkin(
     t_total = time.perf_counter() - t_start
 
     logger.info(
-        "[TIMING] upload=%.3fs face=%.3fs liveness=%.3fs speech=%.3fs database=%.3fs total=%.3fs",
-        t_upload, t_face, t_liveness, t_speech, t_db, t_total
+        "[TIMING] face=%.3fs liveness=%.3fs speech=%.3fs database=%.3fs total=%.3fs",
+        t_face, t_liveness, t_speech, t_db, t_total
     )
-    logger.info("[CHECKIN] Response returned")
 
     checkin = dict(row)
     checkin["face_detail"] = face_detail
@@ -3960,6 +3878,361 @@ def create_checkin(
             "checks": checks,
             "checkin": checkin,
         }
+
+
+def _run_async_checkin_job(job_id: str, user: dict, sentence: str, suffix: str, data: bytes):
+    t_start = time.perf_counter()
+    logger.info("[CHECKIN JOB %s] Starting async check-in verification for owner %s", job_id, user["id"])
+    with _CHECKIN_JOBS_LOCK:
+        if job_id not in _CHECKIN_JOBS:
+            return
+        _CHECKIN_JOBS[job_id]["status"] = "processing"
+
+    try:
+        with db() as connection:
+            owner = connection.execute(
+                "SELECT face_enrollment FROM users WHERE id=?", (user["id"],)
+            ).fetchone()
+        if owner is None or owner["face_enrollment"] is None:
+            with _CHECKIN_JOBS_LOCK:
+                _CHECKIN_JOBS[job_id] = {
+                    "job_id": job_id,
+                    "user_id": user["id"],
+                    "status": "failed",
+                    "error": "Face enrollment is missing. Re-enroll your face before checking in.",
+                    "result": {
+                        "success": False,
+                        "passed": False,
+                        "status": "failed",
+                        "checkin_saved": False,
+                        "message": "Face enrollment is missing. Re-enroll your face before checking in.",
+                        "checks": {"face": "failed", "liveness": "failed", "voice": "failed"},
+                    },
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                }
+            return
+
+        try:
+            enrollment_samples = json.loads(decrypt_bytes(owner["face_enrollment"]))
+        except Exception as error:
+            with _CHECKIN_JOBS_LOCK:
+                _CHECKIN_JOBS[job_id] = {
+                    "job_id": job_id,
+                    "user_id": user["id"],
+                    "status": "failed",
+                    "error": "Face enrollment data could not be read.",
+                    "result": {
+                        "success": False,
+                        "passed": False,
+                        "status": "failed",
+                        "checkin_saved": False,
+                        "message": "Face enrollment data could not be read. Please contact support.",
+                        "checks": {"face": "failed", "liveness": "failed", "voice": "failed"},
+                    },
+                    "created_at": time.time(),
+                    "updated_at": time.time(),
+                }
+            return
+
+        with tempfile.TemporaryDirectory(prefix="cloudguard-checkin-") as directory:
+            video_path = Path(directory) / f"recording{suffix}"
+            video_path.write_bytes(data)
+            logger.info("[CHECKIN JOB %s] Temporary recording written (%d bytes)", job_id, len(data))
+            try:
+                result = _process_verification_and_db(user, video_path, enrollment_samples, sentence, t_start)
+            finally:
+                logger.info("[CHECKIN JOB %s] Temporary recording deleted", job_id)
+
+        with _CHECKIN_JOBS_LOCK:
+            _CHECKIN_JOBS[job_id] = {
+                "job_id": job_id,
+                "user_id": user["id"],
+                "status": "completed",
+                "result": result,
+                "created_at": _CHECKIN_JOBS.get(job_id, {}).get("created_at", time.time()),
+                "updated_at": time.time(),
+            }
+        logger.info("[CHECKIN JOB %s] Finished successfully, passed=%s", job_id, result.get("passed"))
+
+    except VerificationUnavailable as error:
+        logger.warning("[CHECKIN JOB %s] Verification unavailable: %s", job_id, error)
+        with _CHECKIN_JOBS_LOCK:
+            _CHECKIN_JOBS[job_id] = {
+                "job_id": job_id,
+                "user_id": user["id"],
+                "status": "unavailable",
+                "result": {
+                    "success": False,
+                    "checkin_saved": False,
+                    "verification_unavailable": True,
+                    "status": "verification_unavailable",
+                    "message": str(error) or "Live verification services are temporarily unavailable.",
+                    "checks": {
+                        "face": "unavailable",
+                        "liveness": "unavailable",
+                        "voice": "unavailable",
+                    },
+                },
+                "created_at": _CHECKIN_JOBS.get(job_id, {}).get("created_at", time.time()),
+                "updated_at": time.time(),
+            }
+    except Exception as error:
+        logger.exception("[CHECKIN JOB %s] Unexpected verification failure: %s", job_id, error)
+        with _CHECKIN_JOBS_LOCK:
+            _CHECKIN_JOBS[job_id] = {
+                "job_id": job_id,
+                "user_id": user["id"],
+                "status": "unavailable",
+                "result": {
+                    "success": False,
+                    "checkin_saved": False,
+                    "verification_unavailable": True,
+                    "status": "verification_unavailable",
+                    "message": "Verification service is temporarily unavailable. No check-in was recorded. Please try again.",
+                    "checks": {
+                        "face": "unavailable",
+                        "liveness": "unavailable",
+                        "voice": "unavailable",
+                    },
+                },
+                "created_at": _CHECKIN_JOBS.get(job_id, {}).get("created_at", time.time()),
+                "updated_at": time.time(),
+            }
+    finally:
+        _cleanup_old_checkin_jobs()
+
+
+@app.post("/api/check-ins/start", status_code=202)
+@app.post("/api/checkin/start", status_code=202)
+def start_checkin_job(
+    sentence: str = Form(..., min_length=5, max_length=250),
+    recording: UploadFile = File(...),
+    user: dict = Depends(current_user),
+):
+    logger.info("[CHECKIN ASYNC] Start check-in job requested by owner: %s", user["id"])
+    if sentence not in CHECKIN_SENTENCES:
+        logger.warning("[CHECKIN ERROR] The check-in phrase is not valid.")
+        raise HTTPException(status_code=422, detail="The check-in phrase is not valid. Start a new check-in and try again.")
+    if not providers_available():
+        logger.warning("[CHECKIN ERROR] Live verification dependencies are unavailable")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "checkin_saved": False,
+                "verification_unavailable": True,
+                "status": "verification_unavailable",
+                "message": "Live verification services are temporarily unavailable.",
+                "checks": {
+                    "face": "unavailable",
+                    "liveness": "unavailable",
+                    "voice": "unavailable",
+                },
+            },
+        )
+    suffix = Path(recording.filename or "").suffix.lower()
+    if suffix not in {".webm", ".mp4", ".mov"}:
+        logger.warning("[CHECKIN ERROR] Unsupported recording format: %s", suffix)
+        raise HTTPException(status_code=415, detail="Record a WebM or MP4 check-in clip.")
+    data = recording.file.read(MAX_CHECKIN_BYTES + 1)
+    if not data:
+        logger.warning("[CHECKIN ERROR] The check-in recording is empty.")
+        raise HTTPException(status_code=400, detail="The check-in recording is empty.")
+    if len(data) > MAX_CHECKIN_BYTES:
+        logger.warning("[CHECKIN ERROR] Recording exceeds 20MB limit")
+        raise HTTPException(status_code=413, detail="Check-in recordings must be 20 MB or smaller.")
+
+    content_type = recording.content_type or "unknown"
+    logger.info("[CHECKIN ASYNC] Recording received: filename=%s, content_type=%s, size=%d bytes", recording.filename, content_type, len(data))
+
+    with db() as connection:
+        owner = connection.execute(
+            "SELECT face_enrollment FROM users WHERE id=?", (user["id"],)
+        ).fetchone()
+    if owner is None or owner["face_enrollment"] is None:
+        logger.warning("[CHECKIN ERROR] Face enrollment is missing for owner id=%s", user["id"])
+        raise HTTPException(status_code=409, detail="Face enrollment is missing. Re-enroll your face before checking in.")
+
+    job_id = str(uuid.uuid4())
+    with _CHECKIN_JOBS_LOCK:
+        _CHECKIN_JOBS[job_id] = {
+            "job_id": job_id,
+            "user_id": user["id"],
+            "status": "processing",
+            "result": None,
+            "error": None,
+            "created_at": time.time(),
+            "updated_at": time.time(),
+        }
+
+    thread = threading.Thread(
+        target=_run_async_checkin_job,
+        args=(job_id, user, sentence, suffix, data),
+        daemon=True,
+    )
+    thread.start()
+
+    return {
+        "job_id": job_id,
+        "status": "processing",
+        "message": "Analyzing face, liveness & voice...",
+    }
+
+
+@app.get("/api/check-ins/status/{job_id}")
+@app.get("/api/checkin/status/{job_id}")
+def get_checkin_job_status(job_id: str, user: dict = Depends(current_user)):
+    with _CHECKIN_JOBS_LOCK:
+        job = _CHECKIN_JOBS.get(job_id)
+        if not job or job.get("user_id") != user["id"]:
+            raise HTTPException(status_code=404, detail="Check-in job not found or expired.")
+        job_status = job.get("status", "processing")
+        result = job.get("result")
+
+    if job_status == "processing":
+        return {
+            "job_id": job_id,
+            "status": "processing",
+            "message": "Analyzing face, liveness & voice...",
+        }
+    elif job_status == "completed":
+        return result
+    elif job_status == "unavailable":
+        return JSONResponse(status_code=503, content=result or {
+            "success": False,
+            "checkin_saved": False,
+            "verification_unavailable": True,
+            "status": "verification_unavailable",
+            "message": "Verification service is temporarily unavailable. No check-in was recorded. Please try again.",
+            "checks": {"face": "unavailable", "liveness": "unavailable", "voice": "unavailable"},
+        })
+    elif job_status == "failed":
+        if result:
+            return result
+        return JSONResponse(status_code=422, content={
+            "success": False,
+            "passed": False,
+            "status": "failed",
+            "checkin_saved": False,
+            "message": job.get("error", "Verification failed. Please try again."),
+            "failure_reason": job.get("error", "Verification failed. Please try again."),
+            "checks": {"face": "failed", "liveness": "failed", "voice": "failed"},
+        })
+    return {"job_id": job_id, "status": job_status}
+
+
+@app.post("/api/check-ins", status_code=201)
+def create_checkin(
+    sentence: str = Form(..., min_length=5, max_length=250),
+    recording: UploadFile = File(...),
+    async_mode: bool = False,
+    user: dict = Depends(current_user),
+):
+    if async_mode:
+        return start_checkin_job(sentence=sentence, recording=recording, user=user)
+
+    t_start = time.perf_counter()
+    logger.info("[CHECKIN] Request received")
+    logger.info("[CHECKIN] Authentication verified")
+    logger.info("[CHECKIN] authenticated owner: %s", user["id"])
+    if sentence not in CHECKIN_SENTENCES:
+        logger.warning("[CHECKIN ERROR] The check-in phrase is not valid.")
+        raise HTTPException(status_code=422, detail="The check-in phrase is not valid. Start a new check-in and try again.")
+    if not providers_available():
+        logger.warning("[CHECKIN ERROR] Live verification dependencies are unavailable")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "checkin_saved": False,
+                "verification_unavailable": True,
+                "status": "verification_unavailable",
+                "message": "Live verification services are temporarily unavailable.",
+                "checks": {
+                    "face": "unavailable",
+                    "liveness": "unavailable",
+                    "voice": "unavailable",
+                },
+            },
+        )
+    suffix = Path(recording.filename or "").suffix.lower()
+    if suffix not in {".webm", ".mp4", ".mov"}:
+        logger.warning("[CHECKIN ERROR] Unsupported recording format: %s", suffix)
+        raise HTTPException(status_code=415, detail="Record a WebM or MP4 check-in clip.")
+    data = recording.file.read(MAX_CHECKIN_BYTES + 1)
+    if not data:
+        logger.warning("[CHECKIN ERROR] The check-in recording is empty.")
+        raise HTTPException(status_code=400, detail="The check-in recording is empty.")
+    if len(data) > MAX_CHECKIN_BYTES:
+        logger.warning("[CHECKIN ERROR] Recording exceeds 20MB limit")
+        raise HTTPException(status_code=413, detail="Check-in recordings must be 20 MB or smaller.")
+    
+    content_type = recording.content_type or "unknown"
+    logger.info("[CHECKIN] Recording received: filename=%s, content_type=%s, size=%d bytes", recording.filename, content_type, len(data))
+    print(f"[CHECKIN] Recording received: filename={recording.filename}, content_type={content_type}, size={len(data)} bytes", flush=True)
+
+    with db() as connection:
+        owner = connection.execute(
+            "SELECT face_enrollment FROM users WHERE id=?", (user["id"],)
+        ).fetchone()
+    if owner is None or owner["face_enrollment"] is None:
+        logger.warning("[CHECKIN ERROR] Face enrollment is missing for owner id=%s", user["id"])
+        raise HTTPException(status_code=409, detail="Face enrollment is missing. Re-enroll your face before checking in.")
+    try:
+        enrollment_samples = json.loads(decrypt_bytes(owner["face_enrollment"]))
+    except (ValueError, TypeError) as error:
+        logger.warning("[CHECKIN ERROR] Face enrollment data could not be decrypted")
+        raise HTTPException(status_code=409, detail="Face enrollment data could not be read. Please contact support.") from error
+    
+    with tempfile.TemporaryDirectory(prefix="cloudguard-checkin-") as directory:
+        video_path = Path(directory) / f"recording{suffix}"
+        video_path.write_bytes(data)
+        logger.info("[CHECKIN] Temporary file created")
+        try:
+            result = _process_verification_and_db(user, video_path, enrollment_samples, sentence, t_start)
+        except ValueError as error:
+            logger.warning("[CHECKIN ERROR] %s", error)
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except VerificationUnavailable as error:
+            logger.warning("[CHECKIN ERROR] %s", error)
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "checkin_saved": False,
+                    "verification_unavailable": True,
+                    "status": "verification_unavailable",
+                    "message": str(error) or "Live verification services are temporarily unavailable.",
+                    "checks": {
+                        "face": "unavailable",
+                        "liveness": "unavailable",
+                        "voice": "unavailable",
+                    },
+                },
+            )
+        except Exception as error:
+            logger.exception("[CHECKIN ERROR] Local check-in verification failed unexpectedly.")
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "success": False,
+                    "checkin_saved": False,
+                    "verification_unavailable": True,
+                    "status": "verification_unavailable",
+                    "message": "Local verification could not complete. No result was saved; check the API log and try again.",
+                    "checks": {
+                        "face": "unavailable",
+                        "liveness": "unavailable",
+                        "voice": "unavailable",
+                    },
+                },
+            )
+        finally:
+            logger.info("[CHECKIN] Temporary recording deleted")
+
+    logger.info("[CHECKIN] Response returned")
+    return result
 
 
 @app.get("/api/check-ins")

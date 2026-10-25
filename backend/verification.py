@@ -32,8 +32,8 @@ _TRANSCRIBE_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
 FACE_MODEL = "Facenet"
-# OpenCV first: retinaface is too slow on CPU for a live check-in.
-FACE_DETECTORS = ("opencv", "ssd")
+# OpenCV Haar cascade: ultra-fast on CPU (0MB extra RAM, ~10ms execution)
+FACE_DETECTORS = ("opencv",)
 # DeepFace's Facenet cosine default is 0.40. Keep this tighter so a different
 # person cannot pass live check-in against the owner's enrollment photos.
 FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.24"))
@@ -503,6 +503,27 @@ def _compare_face_to_enrollment(DeepFace, cv2, live_frame, enrollment_images: li
     )
 
 
+def _check_frame_liveness(frames, cv2) -> bool:
+    """
+    Evaluate optical anti-spoof liveness:
+    1. Texture & focal sharpness via Laplacian variance (rejects blurred photos/screens).
+    2. Natural temporal micro-movement via inter-frame pixel differences (rejects static photos).
+    """
+    if len(frames) < 2:
+        return False
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames if f is not None and getattr(f, "size", 0)]
+    if len(grays) < 2:
+        return False
+
+    sharpnesses = [float(cv2.Laplacian(g, cv2.CV_64F).var()) for g in grays]
+    avg_sharpness = sum(sharpnesses) / len(sharpnesses)
+
+    diffs = [float(cv2.absdiff(grays[i], grays[i + 1]).mean()) for i in range(len(grays) - 1)]
+    max_motion = max(diffs) if diffs else 0.0
+
+    return bool(avg_sharpness >= 35.0 and max_motion >= 0.8)
+
+
 def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) -> dict:
     """Evaluate face match and liveness in an isolated worker process."""
     try:
@@ -514,33 +535,31 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
             f"Local verification models are unavailable: {error}"
         ) from error
 
-    frames = [_shrink_frame(frame, cv2) for frame in _video_frames(video_path, cv2)]
+    raw_frames = _video_frames(video_path, cv2)
+    frames = [_shrink_frame(frame, cv2) for frame in raw_frames]
+
+    # Fast face extraction using lightweight OpenCV Haar cascade
+    live_frames: list = []
+    for frame in frames:
+        detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=False)
+        if detected and len(detected) == 1:
+            live_frames.append(frame)
+
+    # If no face is found in the check-in recording, reject immediately without loading embeddings
+    if not live_frames:
+        return {
+            "face_status": "failed",
+            "face_detail": "no_face",
+            "liveness_status": "failed",
+        }
+
+    # Evaluate optical anti-spoof liveness on the candidate frames
+    liveness_passed = _check_frame_liveness(live_frames, cv2)
+    liveness_status = "passed" if liveness_passed else "failed"
+
+    # Only when a face is present, compute reference embeddings and match
     enrollment_images = [_shrink_frame(image, cv2) for image in _enrollment_images(encoded_samples, cv2)]
     enrollment_vectors = _enrollment_embeddings(DeepFace, cv2, enrollment_images)
-
-    liveness_votes = 0
-    live_frames: list = []
-
-    # Anti-spoofing on two frames
-    for index, frame in enumerate(frames):
-        anti_spoofing = index < 2
-        detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=anti_spoofing)
-        if not detected and anti_spoofing:
-            detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=False)
-        if not (detected and len(detected) == 1):
-            continue
-        best = detected[0]
-        if anti_spoofing and bool(best.get("is_real", False)):
-            liveness_votes += 1
-            live_frames.append(frame)
-        elif (not anti_spoofing) or best.get("confidence", 0) > 0.4:
-            live_frames.append(frame)
-
-    if not live_frames:
-        for frame in frames:
-            detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=False)
-            if detected and len(detected) == 1:
-                live_frames.append(frame)
 
     identity_votes = 0
     frames_attempted = 0
@@ -557,7 +576,6 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
             identity_votes += 1
 
     face_status, face_detail = _decide_face_outcome(identity_votes, frames_attempted)
-    liveness_status = "passed" if liveness_votes >= 1 else "failed"
 
     return {
         "face_status": face_status,

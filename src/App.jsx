@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import HomePage from './HomePage.jsx'
 import { supabase } from './supabase.js'
 
-const API_URL = '/api'
+const API_URL = (import.meta.env.VITE_API_URL || '/api').replace(/\/+$/, '')
 const NAV_ITEMS = [
   { id: 'dashboard', label: 'Overview', icon: 'grid' },
   { id: 'documents', label: 'My documents', icon: 'file' },
@@ -27,15 +27,24 @@ function describeError(detail, status) {
       const location = Array.isArray(item.loc) ? item.loc.filter((part) => part !== 'body').join(' → ') : ''
       return [location, item.msg].filter(Boolean).join(': ')
     })
-    return messages.length ? messages.join(' ') : `Request failed (${status}).`
+    if (messages.length) return messages.join(' ')
+    if (status === 409) return 'An account with this email already exists. Please sign in instead.'
+    return `Request failed (${status}).`
   }
   if (detail && typeof detail === 'object') {
     if (typeof detail.detail === 'string') return detail.detail
     if (typeof detail.message === 'string') return detail.message
     if (typeof detail.error === 'string') return detail.error
+    if (status === 409) return 'An account with this email already exists. Please sign in instead.'
     return `Request failed (${status}).`
   }
-  return typeof detail === 'string' && detail ? detail : `Request failed (${status}).`
+  if (typeof detail === 'string' && detail) {
+    if (detail === 'Internal Server Error') return 'Account creation is temporarily unavailable. Please try again.'
+    return detail
+  }
+  if (status === 409) return 'An account with this email already exists. Please sign in instead.'
+  if (status === 500) return 'Account creation is temporarily unavailable. Please try again.'
+  return `Request failed (${status}).`
 }
 
 async function api(path, { token, timeoutMs, ...options } = {}) {
@@ -1249,33 +1258,51 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
     setNotice('')
     const formElement = event.currentTarget
     const form = new FormData(formElement)
-    const email = form.get('email')
-    const password = form.get('password')
+    const email = (form.get('email') || '').trim().toLowerCase()
+    const password = form.get('password') || ''
     setLoading(true)
     try {
       if (mode === 'register') {
-        if (password !== form.get('confirmPassword')) throw new Error('Your passwords do not match.')
+        const name = (form.get('name') || '').trim()
+        const phone = (form.get('phone') || '').trim()
+        const confirmPassword = form.get('confirmPassword') || ''
+        const dateOfBirth = form.get('date_of_birth') || ''
+        const freqVal = Number(form.get('checkin_frequency_value') || 30)
+        const freqUnit = form.get('checkin_frequency_unit') || 'days'
+        const graceVal = Number(form.get('grace_period_value') || 72)
+        const graceUnit = form.get('grace_period_unit') || 'hours'
+
+        // Strict frontend validation before calling backend API
+        if (!name || name.length < 2) throw new Error('Please enter your full name (at least 2 characters).')
+        if (!email || !email.includes('@')) throw new Error('Please enter a valid email address.')
+        if (!phone || phone.length < 5) throw new Error('Please enter a valid phone number.')
+        if (!password || password.length < 10) throw new Error('Password must be at least 10 characters.')
+        if (password !== confirmPassword) throw new Error('Your passwords do not match. Please verify both password fields.')
+        if (isNaN(freqVal) || freqVal <= 0) throw new Error('Please enter a valid check-in frequency greater than 0.')
+        if (isNaN(graceVal) || graceVal <= 0) throw new Error('Please enter a valid grace period greater than 0.')
         if (faceSamples.length !== 5) throw new Error('Capture all 5 face samples to finish creating your account.')
+
         const response = await api('/auth/register', {
           method: 'POST',
           body: JSON.stringify({
-            name: form.get('name'),
+            name,
             email,
-            phone: form.get('phone'),
+            phone,
             password,
-            date_of_birth: form.get('date_of_birth') || '',
-            checkin_frequency_value: Number(form.get('checkin_frequency_value') || 30),
-            checkin_frequency_unit: form.get('checkin_frequency_unit') || 'days',
-            grace_period_value: Number(form.get('grace_period_value') || 72),
-            grace_period_unit: form.get('grace_period_unit') || 'hours',
-            face_enrollment_samples_b64: faceSamples.map((sample) => sample.split(',')[1]),
+            date_of_birth: dateOfBirth,
+            checkin_frequency_value: freqVal,
+            checkin_frequency_unit: freqUnit,
+            grace_period_value: graceVal,
+            grace_period_unit: graceUnit,
+            face_enrollment_samples_b64: faceSamples.map((sample) => (sample.includes(',') ? sample.split(',')[1] : sample)),
           }),
         })
-        setNotice(response.message)
+        setNotice(response.message || 'Account created successfully. Please sign in to continue.')
         setMode('login')
         setFaceSamples([])
         stopEnrollmentCamera()
         formElement.reset()
+        if (window.location.hash) window.history.replaceState(null, '', '#login')
       } else if (mode === 'recipient-login') {
         const response = await api('/recipient/login', {
           method: 'POST',
@@ -1389,7 +1416,7 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
               <div className="input-row" style={{ marginTop: '8px' }}>
                 <label>Check-in frequency
                   <div style={{ display: 'flex', gap: '6px' }}>
-                    <input name="checkin_frequency_value" type="number" defaultValue="30" min="5" style={{ width: '80px' }} required />
+                    <input name="checkin_frequency_value" type="number" defaultValue="30" min="1" style={{ width: '80px' }} required />
                     <select name="checkin_frequency_unit" defaultValue="days">
                       <option value="seconds">Seconds (Demo)</option>
                       <option value="minutes">Minutes</option>
@@ -1400,7 +1427,7 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
                 </label>
                 <label>Grace period
                   <div style={{ display: 'flex', gap: '6px' }}>
-                    <input name="grace_period_value" type="number" defaultValue="72" min="5" style={{ width: '80px' }} required />
+                    <input name="grace_period_value" type="number" defaultValue="72" min="1" style={{ width: '80px' }} required />
                     <select name="grace_period_unit" defaultValue="hours">
                       <option value="seconds">Seconds (Demo)</option>
                       <option value="minutes">Minutes</option>

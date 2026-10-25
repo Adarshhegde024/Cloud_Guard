@@ -93,6 +93,9 @@ cors_origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
 if not cors_origins:
     cors_origins = ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"]
 
+if "https://cloud-guard-one.vercel.app" not in cors_origins:
+    cors_origins.append("https://cloud-guard-one.vercel.app")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -564,8 +567,8 @@ def normalize_time_to_seconds(value: int, unit: str) -> int:
     if value <= 0:
         raise HTTPException(status_code=422, detail="Time value must be a positive number greater than 0.")
     total_seconds = value * UNIT_TO_SECONDS[unit_norm]
-    if total_seconds < 5:
-        raise HTTPException(status_code=422, detail="Configured time value must normalize to at least 5 seconds.")
+    if total_seconds < 1:
+        raise HTTPException(status_code=422, detail="Configured time value must normalize to at least 1 second.")
     if total_seconds > 31536000:
         raise HTTPException(status_code=422, detail="Configured time value cannot exceed 365 days.")
     return total_seconds
@@ -2917,27 +2920,52 @@ def recipient_history(recipient: dict = Depends(recipient_principal)) -> dict:
 def register(payload: RegisterPayload) -> dict:
     if len(payload.password.encode("utf-8")) > 72:
         raise HTTPException(status_code=422, detail="Password must be 72 bytes or fewer.")
-    decoded_samples = []
-    for encoded_sample in payload.face_enrollment_samples_b64:
-        if len(encoded_sample) > 3 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="Each face sample must be 2 MB or smaller.")
-        try:
-            raw = base64.b64decode(encoded_sample, validate=True)
-        except ValueError as error:
-            raise HTTPException(status_code=422, detail="A face enrollment sample is not valid base64.") from error
-        if len(raw) > 2 * 1024 * 1024:
-            raise HTTPException(status_code=413, detail="Each face sample must be 2 MB or smaller.")
-        if not (raw.startswith(b"\xff\xd8\xff") or raw.startswith(b"\x89PNG\r\n\x1a\n")):
-            raise HTTPException(status_code=422, detail="Each face sample must be a JPEG or PNG image.")
-        decoded_samples.append(encoded_sample)
-    face_blob = encrypt_bytes(json.dumps(decoded_samples, separators=(",", ":")).encode("ascii"))
+    if len(payload.password) < 10:
+        raise HTTPException(status_code=422, detail="Password must be at least 10 characters.")
     
+    clean_email = payload.email.strip().lower()
+    
+    # 1. Pre-check for duplicate email in database before heavy processing
+    with db() as connection:
+        existing_user = connection.execute("SELECT id FROM users WHERE email = ?", (clean_email,)).fetchone()
+        if existing_user:
+            raise HTTPException(status_code=409, detail="An account with this email already exists. Please sign in instead.")
+    
+    # 2. Validate face enrollment samples
+    if len(payload.face_enrollment_samples_b64) != 5:
+        raise HTTPException(status_code=422, detail="Face enrollment failed. Exactly 5 face samples are required. Please retake your face samples.")
+    
+    decoded_samples = []
+    for idx, encoded_sample in enumerate(payload.face_enrollment_samples_b64):
+        if not encoded_sample:
+            raise HTTPException(status_code=422, detail=f"Face sample {idx + 1} is empty. Please retake your face samples.")
+        clean_b64 = encoded_sample.split(",")[-1].strip()
+        if len(clean_b64) > 5 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail=f"Face sample {idx + 1} exceeds size limit. Please retake your face samples.")
+        try:
+            raw = base64.b64decode(clean_b64, validate=False)
+        except Exception as error:
+            raise HTTPException(status_code=422, detail=f"Face sample {idx + 1} could not be processed. Please retake your face samples.") from error
+        
+        is_jpeg = raw.startswith(b"\xff\xd8\xff")
+        is_png = raw.startswith(b"\x89PNG\r\n\x1a\n")
+        is_webp = raw.startswith(b"RIFF") and b"WEBP" in raw[:16]
+        if not (is_jpeg or is_png or is_webp):
+            raise HTTPException(status_code=422, detail=f"Face sample {idx + 1} must be a valid JPEG, PNG, or WebP image. Please retake your face samples.")
+        decoded_samples.append(clean_b64)
+    
+    try:
+        face_blob = encrypt_bytes(json.dumps(decoded_samples, separators=(",", ":")).encode("ascii"))
+    except Exception as e:
+        logger.exception(f"Face encryption failure: {e}")
+        raise HTTPException(status_code=500, detail="Face enrollment processing failed. Please retake your face samples.") from e
+
     freq_val = payload.checkin_frequency_value or 30
-    freq_unit = (payload.checkin_frequency_unit or "days").lower()
+    freq_unit = (payload.checkin_frequency_unit or "days").strip().lower()
     freq_sec = normalize_time_to_seconds(freq_val, freq_unit)
     
     grace_val = payload.grace_period_value or 72
-    grace_unit = (payload.grace_period_unit or "hours").lower()
+    grace_unit = (payload.grace_period_unit or "hours").strip().lower()
     grace_sec = normalize_time_to_seconds(grace_val, grace_unit)
     
     dob = (payload.date_of_birth or "").strip()
@@ -2948,6 +2976,11 @@ def register(payload: RegisterPayload) -> dict:
 
     try:
         with db() as connection:
+            # Secondary concurrency check
+            dup = connection.execute("SELECT id FROM users WHERE email = ?", (clean_email,)).fetchone()
+            if dup:
+                raise HTTPException(status_code=409, detail="An account with this email already exists. Please sign in instead.")
+            
             cursor = connection.execute(
                 """INSERT INTO users(name,email,phone,password_hash,face_enrollment,
                            checkin_interval,checkin_frequency_value,checkin_frequency_unit,checkin_frequency_seconds,
@@ -2957,7 +2990,7 @@ def register(payload: RegisterPayload) -> dict:
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     payload.name.strip(),
-                    payload.email.strip().lower(),
+                    clean_email,
                     payload.phone.strip(),
                     bcrypt.hashpw(payload.password.encode("utf-8"), bcrypt.gensalt()),
                     face_blob,
@@ -2979,29 +3012,38 @@ def register(payload: RegisterPayload) -> dict:
             audit(connection, user_id, "account.created")
             user = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             
-            # Sync to Supabase
-            supabase_sync.sync_record_sync("users", {
-                "id": user_id,
-                "name": payload.name.strip(),
-                "email": payload.email.strip().lower(),
-                "phone": payload.phone.strip(),
-                "password_hash": "$2b$...[hashed]",
-                "checkin_interval": interval_days,
-                "checkin_frequency_value": freq_val,
-                "checkin_frequency_unit": freq_unit,
-                "checkin_frequency_seconds": freq_sec,
-                "grace_period_value": grace_val,
-                "grace_period_unit": grace_unit,
-                "grace_period_seconds": grace_sec,
-                "date_of_birth": dob,
-                "identity_status": "verified" if dob else "pending",
-                "account_state": "ACTIVE",
-                "next_checkin_deadline": next_deadline,
-                "created_at": now_iso,
-            }, on_conflict="id")
-    except sqlite3.IntegrityError as error:
-        raise HTTPException(status_code=409, detail="An account with this email already exists.") from error
-    return {"user": public_user(user), "message": "Account created. You can now sign in."}
+            # Failsafe Supabase sync
+            try:
+                supabase_sync.sync_record_sync("users", {
+                    "id": user_id,
+                    "name": payload.name.strip(),
+                    "email": clean_email,
+                    "phone": payload.phone.strip(),
+                    "date_of_birth": dob,
+                    "identity_status": "verified" if dob else "pending",
+                    "account_state": "ACTIVE",
+                    "checkin_interval": interval_days,
+                    "checkin_frequency_value": freq_val,
+                    "checkin_frequency_unit": freq_unit,
+                    "checkin_frequency_seconds": freq_sec,
+                    "grace_period_value": grace_val,
+                    "grace_period_unit": grace_unit,
+                    "grace_period_seconds": grace_sec,
+                    "next_checkin_deadline": next_deadline,
+                    "created_at": now_iso,
+                }, on_conflict="id")
+            except Exception as sync_err:
+                logger.warning(f"Supabase sync warning on register: {sync_err}")
+    except HTTPException:
+        raise
+    except Exception as error:
+        err_str = str(error).lower()
+        if "unique" in err_str or "duplicate" in err_str or "already exists" in err_str or (psycopg2 and isinstance(error, psycopg2.IntegrityError)):
+            raise HTTPException(status_code=409, detail="An account with this email already exists. Please sign in instead.") from error
+        logger.exception(f"Unexpected database error during registration: {error}")
+        raise HTTPException(status_code=500, detail="Account creation is temporarily unavailable. Please try again.") from error
+        
+    return {"user": public_user(user), "message": "Account created successfully. Please sign in to continue."}
 
 
 @app.post("/api/auth/google")

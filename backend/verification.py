@@ -35,13 +35,16 @@ logger = logging.getLogger(__name__)
 
 FACE_MODEL = "Facenet"
 # Robust face matching distance threshold (DeepFace Facenet cosine default is 0.40)
-# 0.35 admits authentic owners across natural lighting/angles while blocking other individuals.
-FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.35"))
-MIN_FACE_PX = 40
+# 0.36 admits authentic owners across natural lighting/angles while blocking other individuals.
+FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.36"))
+MIN_FACE_PX = 24
 MAX_FACE_FRAME_COVERAGE = 0.85
-# Sample 8 frames spanning beginning, early-middle, middle, late-middle, and end of the 12s recording
-_FRAME_SAMPLE_FRACTIONS = (0.12, 0.22, 0.35, 0.48, 0.60, 0.72, 0.84, 0.92)
-_MAX_FRAME_SIDE = 640
+# Sample 16 frames spanning the full 12s recording (every ~0.75s)
+_FRAME_SAMPLE_FRACTIONS = (
+    0.06, 0.12, 0.18, 0.24, 0.30, 0.36, 0.42, 0.48,
+    0.54, 0.60, 0.66, 0.72, 0.78, 0.84, 0.90, 0.94
+)
+_MAX_FRAME_SIDE = 960
 _TRANSCRIBE_SECONDS = 35
 
 
@@ -120,12 +123,17 @@ def _frames_from_av(video_path: Path) -> list:
         if not container.streams.video:
             raise ValueError("The recording could not be opened. Please record again.")
         stream = container.streams.video[0]
+        width = getattr(stream.codec_context, "width", None) or getattr(stream, "width", 0)
+        height = getattr(stream.codec_context, "height", None) or getattr(stream, "height", 0)
+        codec_name = getattr(stream.codec_context, "name", None) or getattr(stream, "name", "unknown")
         duration = 0.0
         if container.duration is not None:
             duration = float(container.duration) / av.time_base
         elif stream.duration is not None and stream.time_base is not None:
             duration = float(stream.duration * stream.time_base)
         _reject_duration(duration)
+        logger.info("[DECODE] PyAV opened video: codec=%s, resolution=%dx%d, duration=%.2fs", codec_name, width, height, duration)
+        print(f"[DECODE] PyAV opened video: codec={codec_name}, resolution={width}x{height}, duration={duration:.2f}s", flush=True)
 
         all_video_frames = []
         for index, frame in enumerate(container.decode(video=0)):
@@ -146,6 +154,8 @@ def _frames_from_av(video_path: Path) -> list:
 
         if len(frames) < 2:
             raise ValueError("The recording could not be decoded reliably. Please record again.")
+        logger.info("[DECODE] PyAV decoded %d frames, sampled %d frames across video", total, len(frames))
+        print(f"[DECODE] PyAV decoded {total} frames, sampled {len(frames)} frames across video", flush=True)
         return frames
 
 
@@ -168,11 +178,15 @@ def _frames_from_cv2(video_path: Path, cv2) -> list:
             raise ValueError("The recording could not be decoded reliably. Please record again.")
 
         total = len(all_frames)
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         target_idxs = sorted(set(max(0, min(total - 1, int(total * fr))) for fr in _FRAME_SAMPLE_FRACTIONS))
         frames = [all_frames[i].copy() for i in target_idxs if all_frames[i] is not None and all_frames[i].size]
 
         if len(frames) < 2:
             raise ValueError("The recording could not be decoded reliably. Please record again.")
+        logger.info("[DECODE] OpenCV decoded %d frames (%dx%d), sampled %d frames", total, width, height, len(frames))
+        print(f"[DECODE] OpenCV decoded {total} frames ({width}x{height}), sampled {len(frames)} frames", flush=True)
         return frames
     finally:
         capture.release()
@@ -304,7 +318,7 @@ def _get_cascade(name: str, cv2):
 def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
     """
     Detect candidate face bounding boxes (x, y, w, h) in the given BGR frame.
-    Evaluates multi-scale AdaBoost cascades across standard and illumination-equalized variants.
+    Evaluates multi-scale AdaBoost cascades across CLAHE, global equalized, and raw grayscale variants.
     """
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
@@ -313,28 +327,28 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
     if H < MIN_FACE_PX or W < MIN_FACE_PX:
         return []
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe_gray = clahe.apply(gray)
     equalized = cv2.equalizeHist(gray)
+    variants = (clahe_gray, equalized, gray)
 
-    # Cascades evaluated in order of robust detection:
-    # 1. Frontal alt2 (gentle AdaBoost, highest accuracy on natural poses and webcam angles)
-    # 2. Frontal default (classic frontal Haar)
-    # 3. Frontal alt
-    # 4. Profile face (for heads turned to read phrase)
     cascade_names = [
         "haarcascade_frontalface_alt2.xml",
         "haarcascade_frontalface_default.xml",
         "haarcascade_frontalface_alt.xml",
+        "haarcascade_frontalface_alt_tree.xml",
     ]
 
     found_rects = []
+    # Pass 1: frontal multi-cascade with fine scaleFactor 1.05 and minNeighbors 3
     for c_name in cascade_names:
         cascade = _get_cascade(c_name, cv2)
         if cascade is None:
             continue
-        for img_var in (equalized, gray):
+        for img_var in variants:
             rects = cascade.detectMultiScale(
-                img_var, scaleFactor=1.1, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+                img_var, scaleFactor=1.05, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
             )
             if len(rects) > 0:
                 found_rects.extend(rects)
@@ -342,25 +356,41 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
         if found_rects:
             break
 
-    # If no frontal face detected, check profile cascade (for head turned to read)
+    # Pass 2: profile cascade for reading posture / head turned
     if not found_rects:
         c_prof = _get_cascade("haarcascade_profileface.xml", cv2)
         if c_prof is not None:
-            for img_var in (equalized, gray):
+            for img_var in variants:
                 rects = c_prof.detectMultiScale(
-                    img_var, scaleFactor=1.1, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+                    img_var, scaleFactor=1.05, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
                 )
                 if len(rects) > 0:
                     found_rects.extend(rects)
                     break
             if not found_rects:
-                flipped = cv2.flip(equalized, 1)
+                flipped = cv2.flip(clahe_gray, 1)
                 rects = c_prof.detectMultiScale(
-                    flipped, scaleFactor=1.1, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+                    flipped, scaleFactor=1.05, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
                 )
                 if len(rects) > 0:
                     for (rx, ry, rw, rh) in rects:
                         found_rects.append((W - rx - rw, ry, rw, rh))
+
+    # Pass 3: gentle fallback with minNeighbors=2 if lighting or tilt is difficult
+    if not found_rects:
+        for c_name in ("haarcascade_frontalface_alt2.xml", "haarcascade_frontalface_default.xml"):
+            cascade = _get_cascade(c_name, cv2)
+            if cascade is None:
+                continue
+            for img_var in (clahe_gray, equalized):
+                rects = cascade.detectMultiScale(
+                    img_var, scaleFactor=1.05, minNeighbors=2, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+                )
+                if len(rects) > 0:
+                    found_rects.extend(rects)
+                    break
+            if found_rects:
+                break
 
     # Filter candidates by minimum size and maximum coverage
     valid = []
@@ -427,7 +457,7 @@ def _embedding_from_crop(DeepFace, face_crop):
         )
         if reps and isinstance(reps, list) and len(reps) > 0:
             embedding = reps[0].get("embedding")
-            if embedding and len(embedding) == 128:
+            if embedding and len(embedding) >= 128:
                 return embedding
     except Exception as exc:
         logger.debug("Crop embedding direct array failed: %s", exc)
@@ -448,7 +478,7 @@ def _embedding_from_crop(DeepFace, face_crop):
             )
             if reps and isinstance(reps, list) and len(reps) > 0:
                 embedding = reps[0].get("embedding")
-                if embedding and len(embedding) == 128:
+                if embedding and len(embedding) >= 128:
                     return embedding
         finally:
             try:
@@ -679,7 +709,7 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
         face_status = "failed"
         face_detail = "quality_low"
     else:
-        vote_threshold = max(1, math.ceil(frames_attempted * 0.4))
+        vote_threshold = max(1, math.ceil(frames_attempted * 0.35))
         if identity_votes >= vote_threshold:
             face_status = "passed"
             face_detail = "matched"

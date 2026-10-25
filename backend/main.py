@@ -3743,8 +3743,9 @@ def create_checkin(
         logger.warning("[CHECKIN ERROR] Recording exceeds 20MB limit")
         raise HTTPException(status_code=413, detail="Check-in recordings must be 20 MB or smaller.")
     
-    logger.info("[CHECKIN] Recording received: filename=%s, size=%d bytes", recording.filename, len(data))
-    print(f"[CHECKIN] Recording received: filename={recording.filename}, size={len(data)} bytes", flush=True)
+    content_type = recording.content_type or "unknown"
+    logger.info("[CHECKIN] Recording received: filename=%s, content_type=%s, size=%d bytes", recording.filename, content_type, len(data))
+    print(f"[CHECKIN] Recording received: filename={recording.filename}, content_type={content_type}, size={len(data)} bytes", flush=True)
 
     with db() as connection:
         owner = connection.execute(
@@ -3820,7 +3821,7 @@ def create_checkin(
         if face_detail == "different_person":
             message = "Face verification failed: this person does not match the enrolled face."
         elif face_detail == "no_face":
-            message = "No usable face was detected. Please move closer to the camera, improve lighting, remove strong glare, and keep your face centered."
+            message = "Face verification could not detect a clear face in the recording. Please retry in good lighting, keep your full face visible, and look directly at the camera."
         elif face_detail == "multiple_faces":
             message = "Multiple faces were detected. Please make sure only the account owner is visible."
         elif face_detail == "quality_low":

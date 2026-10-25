@@ -2768,16 +2768,16 @@ function checkinResultCopy(result) {
   }
   return {
     title: differentPerson ? 'Check-in failed' : 'Check-in not passed',
-    summary: differentPerson
+    summary: result.failureReason || (differentPerson
       ? 'Face verification failed: this person does not match the enrolled face.'
       : noFace
-        ? 'Face verification failed: no usable face was found in the check-in recording.'
-        : 'At least one verification check did not pass. See the details below and try again.',
+        ? 'Face verification could not detect a clear face in the recording. Please retry in good lighting, keep your full face visible, and look directly at the camera.'
+        : 'At least one verification check did not pass. See the details below and try again.'),
     faceLabel: differentPerson ? 'Different person' : 'Not passed',
     faceHint: differentPerson
       ? 'The live face does not match your enrollment photos. Check-in failed because this appears to be a different person.'
       : noFace
-        ? 'Keep your face centred and well lit, then record again.'
+        ? 'Keep your full face visible and well lit, looking directly at the camera, then record again.'
         : 'Face not matched. Ensure good lighting and centre your face, matching your enrollment photos.',
   }
 }

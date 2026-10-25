@@ -1620,6 +1620,7 @@ function App() {
     return 'login'
   })
   const [page, setPage] = useState('dashboard')
+  const [checkinKey, setCheckinKey] = useState(0)
   const [profileOpen, setProfileOpen] = useState(false)
   const [authNotice, setAuthNotice] = useState('')
   const [toast, setToast] = useState('')
@@ -1918,6 +1919,9 @@ function App() {
   }
 
   function navigate(nextPage) {
+    if (nextPage === 'checkin') {
+      setCheckinKey((k) => k + 1)
+    }
     setPage(nextPage)
     setError('')
     setProfileOpen(false)
@@ -2084,7 +2088,7 @@ function App() {
           {page === 'documents' && <Documents data={pageData.documents || []} token={token} onChange={load} />}
           {page === 'recipients' && <Recipients data={pageData.recipients || []} token={token} onChange={load} />}
           {page === 'nominee' && <Nominee data={pageData.nominee || null} token={token} onChange={load} />}
-          {page === 'checkin' && <Checkin token={token} onNavigate={navigate} onComplete={async (checkin) => { await load(); notify(checkin.status === 'success' ? 'Check-in passed.' : checkin.face_status !== 'passed' && (checkin.face_detail === 'different_person' || checkin.face_detail === 'mismatch') ? 'Check-in failed: the live face does not match enrollment.' : 'Check-in recorded. Verification did not pass.') }} />}
+          {page === 'checkin' && <Checkin key={`checkin-${checkinKey}`} token={token} onNavigate={navigate} onComplete={async (checkin) => { await load(); notify(checkin.status === 'success' ? 'Check-in passed.' : checkin.face_status !== 'passed' && (checkin.face_detail === 'different_person' || checkin.face_detail === 'mismatch') ? 'Check-in failed: the live face does not match enrollment.' : 'Check-in recorded. Verification did not pass.') }} />}
           {page === 'settings' && <LegacySecuritySettings token={token} user={user} onRefresh={load} notify={notify} />}
           {page === 'history' && <History data={pageData.checkins || []} token={token} />}
           {page === 'profile' && <Profile data={user} token={token} onSave={(updated) => { setUser(updated); localStorage.setItem('cloudguard_user', JSON.stringify(updated)); notify('Your profile has been updated.') }} />}
@@ -2857,6 +2861,26 @@ function Checkin({ token, onComplete, onNavigate }) {
     return () => { active = false }
   }, [])
 
+  // Auto-request permissions if already granted in this browser
+  useEffect(() => {
+    let cancelled = false
+    async function checkGrantedPermissions() {
+      if (!navigator.permissions?.query || !navigator.mediaDevices?.getUserMedia) return
+      try {
+        const cam = await navigator.permissions.query({ name: 'camera' })
+        const mic = await navigator.permissions.query({ name: 'microphone' })
+        if (!cancelled && cam.state === 'granted' && mic.state === 'granted') {
+          console.log('[CHECKIN] Camera and microphone already granted, initializing stream automatically')
+          requestPermissions()
+        }
+      } catch {
+        // Browser does not support permissions.query or threw; wait for user click
+      }
+    }
+    checkGrantedPermissions()
+    return () => { cancelled = true }
+  }, [])
+
   async function requestPermissions() {
     setPermissionError(null)
     setError('')
@@ -2888,42 +2912,7 @@ function Checkin({ token, onComplete, onNavigate }) {
       return
     }
 
-    // 3. Pre-check permissions status if supported
-    if (navigator.permissions?.query) {
-      try {
-        const camPerm = await navigator.permissions.query({ name: 'camera' })
-        const micPerm = await navigator.permissions.query({ name: 'microphone' })
-        console.log(`[CHECKIN] permission state: camera=${camPerm.state}, microphone=${micPerm.state}`)
-        if (camPerm.state === 'denied' && micPerm.state === 'denied') {
-          setPermissionError({
-            title: 'Camera and microphone permissions are required',
-            message: 'Please allow camera and microphone access in your browser settings and try again.',
-          })
-          setState('idle')
-          return
-        }
-        if (camPerm.state === 'denied') {
-          setPermissionError({
-            title: 'Camera permission is required',
-            message: 'Please allow camera access in your browser settings and try again.',
-          })
-          setState('idle')
-          return
-        }
-        if (micPerm.state === 'denied') {
-          setPermissionError({
-            title: 'Microphone permission is required',
-            message: 'Please allow microphone access in your browser settings and try again.',
-          })
-          setState('idle')
-          return
-        }
-      } catch (qErr) {
-        // Permissions query might throw in Firefox or unsupported browsers; continue to getUserMedia
-      }
-    }
-
-    // 4. Authoritative getUserMedia call
+    // 3. Authoritative getUserMedia call (preserves active user gesture!)
     try {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((t) => t.stop())
@@ -2957,12 +2946,18 @@ function Checkin({ token, onComplete, onNavigate }) {
 
       streamRef.current = stream
       if (videoRef.current) {
+        if (videoRef.current.src) {
+          URL.revokeObjectURL(videoRef.current.src)
+          videoRef.current.removeAttribute('src')
+        }
+        videoRef.current.controls = false
+        videoRef.current.muted = true
         videoRef.current.srcObject = stream
         await videoRef.current.play().catch(() => {})
       }
       setStreamOn(true)
 
-      // Fetch a phrase from the server or use a random fallback
+      // Fetch dynamic phrase from backend
       try {
         const phraseRes = await api('/check-ins/phrase', { timeoutMs: 5000 })
         if (phraseRes?.sentence) {
@@ -2980,8 +2975,8 @@ function Checkin({ token, onComplete, onNavigate }) {
       console.error(`[CHECKIN] getUserMedia error: ${permError.name || 'Error'}`)
       console.error(permError)
 
-      let title = 'Permission required'
-      let message = 'Camera and microphone access are required to perform a live check-in. Please allow permissions in your browser and try again.'
+      let title = 'Camera and microphone permissions are required'
+      let message = 'Please allow camera and microphone access in your browser to complete your live check-in.'
 
       let camState = 'prompt'
       let micState = 'prompt'
@@ -3002,24 +2997,16 @@ function Checkin({ token, onComplete, onNavigate }) {
 
       if (camState === 'denied' && micState !== 'denied') {
         title = 'Camera permission is required'
-        message = 'Please allow camera access in your browser settings and try again.'
+        message = 'Please allow camera access in your browser settings (click the camera icon in your address bar) and try again.'
       } else if (micState === 'denied' && camState !== 'denied') {
         title = 'Microphone permission is required'
-        message = 'Please allow microphone access in your browser settings and try again.'
+        message = 'Please allow microphone access in your browser settings (click the microphone icon in your address bar) and try again.'
       } else if (camState === 'denied' && micState === 'denied') {
         title = 'Camera and microphone permissions are required'
         message = 'Please allow camera and microphone access in your browser settings and try again.'
       } else if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError') {
-        if (errMsg.includes('camera') && !errMsg.includes('microphone')) {
-          title = 'Camera permission is required'
-          message = 'Please allow camera access in your browser settings and try again.'
-        } else if (errMsg.includes('microphone') && !errMsg.includes('camera')) {
-          title = 'Microphone permission is required'
-          message = 'Please allow microphone access in your browser settings and try again.'
-        } else {
-          title = 'Camera and microphone permissions are required'
-          message = 'Please allow camera and microphone access in your browser settings and try again.'
-        }
+        title = 'Permission denied'
+        message = 'Camera and microphone permissions were denied or dismissed. Click the lock/settings icon next to the URL to allow camera and microphone, then try again.'
       } else if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError') {
         title = 'Device not found'
         message = 'No camera or microphone was found on this device. Please connect a camera and microphone, then try again.'
@@ -3095,6 +3082,17 @@ function Checkin({ token, onComplete, onNavigate }) {
         if (clip.size > 0) {
           setHasClip(true)
           setState('recorded')
+          if (videoRef.current) {
+            try {
+              videoRef.current.srcObject = null
+              videoRef.current.src = URL.createObjectURL(clip)
+              videoRef.current.controls = true
+              videoRef.current.muted = false
+              videoRef.current.play().catch(() => {})
+            } catch (playErr) {
+              console.warn('[CHECKIN] preview playback warning:', playErr)
+            }
+          }
         } else {
           setHasClip(false)
           setError('Recording failed to capture video data. Please try again.')
@@ -3127,6 +3125,12 @@ function Checkin({ token, onComplete, onNavigate }) {
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
     if (videoRef.current) {
+      videoRef.current.controls = false
+      videoRef.current.muted = true
+      if (videoRef.current.src) {
+        URL.revokeObjectURL(videoRef.current.src)
+        videoRef.current.removeAttribute('src')
+      }
       videoRef.current.srcObject = null
     }
     setStreamOn(false)
@@ -3329,6 +3333,20 @@ function Checkin({ token, onComplete, onNavigate }) {
     }
   }
 
+  // Robust step state calculations
+  const step1Done = Boolean(streamOn || state === 'ready' || state === 'recording' || state === 'recorded' || (hasClip && (state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed')))
+  const step1Current = state === 'idle' || state === 'permission_request'
+
+  const step2Done = state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || (hasClip && state === 'failed')
+  const step2Current = state === 'ready'
+
+  const step3Done = state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || (hasClip && state === 'failed')
+  const step3Current = state === 'recording'
+
+  const step4Done = state === 'success'
+  const step4Current = state === 'success' || (hasClip && (state === 'failed' || state === 'unavailable'))
+  const step4Active = state === 'submitting' || state === 'processing'
+
   return (
     <div className="page-content checkin-page">
       <div className="verification-banner">
@@ -3350,17 +3368,17 @@ function Checkin({ token, onComplete, onNavigate }) {
           </div>
 
           <div className="checkin-steps">
-            <div className={`checkin-step ${state !== 'idle' && state !== 'permission_request' ? 'step-done' : 'step-current'}`}>
-              <span>01</span><div><b>Allow camera & microphone</b><small>They’re used only for this check-in.</small></div>{(state !== 'idle' && state !== 'permission_request') && <span className="step-check">✓</span>}
+            <div className={`checkin-step ${step1Done ? 'step-done' : step1Current ? 'step-current' : ''}`}>
+              <span>01</span><div><b>Allow camera & microphone</b><small>They’re used only for this check-in.</small></div>{step1Done && <span className="step-check">✓</span>}
             </div>
-            <div className={`checkin-step ${(state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') ? 'step-done' : state === 'ready' ? 'step-current' : ''}`}>
-              <span>02</span><div><b>Read your personal phrase</b><small>A new phrase is chosen each time.</small></div>{(state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') && <span className="step-check">✓</span>}
+            <div className={`checkin-step ${step2Done ? 'step-done' : step2Current ? 'step-current' : ''}`}>
+              <span>02</span><div><b>Read your personal phrase</b><small>A new phrase is chosen each time.</small></div>{step2Done && <span className="step-check">✓</span>}
             </div>
-            <div className={`checkin-step ${(state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') ? 'step-done' : state === 'recording' ? 'step-current' : ''}`}>
-              <span>03</span><div><b>Record a short live clip</b><small>Keep your face in frame as you speak.</small></div>{(state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') && <span className="step-check">✓</span>}
+            <div className={`checkin-step ${step3Done ? 'step-done' : step3Current ? 'step-current' : ''}`}>
+              <span>03</span><div><b>Record a short live clip</b><small>Keep your face in frame as you speak.</small></div>{step3Done && <span className="step-check">✓</span>}
             </div>
-            <div className={`checkin-step ${state === 'success' || state === 'failed' || state === 'unavailable' ? 'step-current' : state === 'submitting' || state === 'processing' ? 'step-active' : ''}`}>
-              <span>04</span><div><b>Review your result</b><small>See whether verification passed.</small></div>{state === 'success' && <span className="step-check">✓</span>}
+            <div className={`checkin-step ${step4Done ? 'step-done' : step4Current ? 'step-current' : step4Active ? 'step-active' : ''}`}>
+              <span>04</span><div><b>Review your result</b><small>See whether verification passed.</small></div>{step4Done && <span className="step-check">✓</span>}
             </div>
           </div>
 
@@ -3371,6 +3389,14 @@ function Checkin({ token, onComplete, onNavigate }) {
               <small>Speak clearly and naturally while looking directly at the camera.</small>
             </div>
           )}
+
+          <video
+            className={`checkin-video ${state === 'ready' || state === 'recording' || state === 'recorded' ? 'video-visible' : ''}`}
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted={state !== 'recorded'}
+          />
 
           {error && !permissionError && <div className="notice notice-error">{error}</div>}
 
@@ -3602,14 +3628,6 @@ function Checkin({ token, onComplete, onNavigate }) {
               </div>
             </div>
           )}
-
-          <video
-            className={`checkin-video ${state === 'ready' || state === 'recording' || state === 'recorded' ? 'video-visible' : ''}`}
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-          />
         </section>
 
       <aside className="checkin-aside">
@@ -3632,8 +3650,6 @@ function Checkin({ token, onComplete, onNavigate }) {
   </div>
   )
 }
-
-
 function LegacySecuritySettings({ token, user, onRefresh, notify }) {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)

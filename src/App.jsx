@@ -3175,7 +3175,7 @@ function Checkin({ token, onComplete, onNavigate }) {
           token,
           method: 'POST',
           body: form,
-          timeoutMs: 90000,
+          timeoutMs: 120000,
         })
       } catch (startErr) {
         if (startErr.status === 404) {
@@ -3183,7 +3183,7 @@ function Checkin({ token, onComplete, onNavigate }) {
             token,
             method: 'POST',
             body: form,
-            timeoutMs: 90000,
+            timeoutMs: 120000,
           })
         } else {
           throw startErr
@@ -3211,14 +3211,14 @@ function Checkin({ token, onComplete, onNavigate }) {
         console.log(`[CHECKIN] job id: ${jobId}`)
         setState('processing')
         const pollStartTime = Date.now()
-        const maxWaitMs = 180000
+        const maxWaitMs = 240000
         while (Date.now() - pollStartTime < maxWaitMs) {
           await new Promise((resolve) => setTimeout(resolve, 2000))
           try {
             console.log('[CHECKIN] polling job status')
             const statusRes = await api(`/check-ins/status/${jobId}`, {
               token,
-              timeoutMs: 15000,
+              timeoutMs: 30000,
             })
             if (statusRes.status !== 'processing') {
               response = statusRes
@@ -3350,13 +3350,13 @@ function Checkin({ token, onComplete, onNavigate }) {
   }
 
   // Robust step state calculations
-  const step1Done = Boolean(streamOn || state === 'ready' || state === 'recording' || state === 'recorded' || (hasClip && (state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed')))
+  const step1Done = Boolean(streamOn || state === 'ready' || state === 'recording' || state === 'recorded' || (hasClip && (state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed' || state === 'unavailable')))
   const step1Current = state === 'idle' || state === 'permission_request'
 
-  const step2Done = state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || (hasClip && state === 'failed')
+  const step2Done = state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || (hasClip && (state === 'failed' || state === 'unavailable'))
   const step2Current = state === 'ready'
 
-  const step3Done = state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || (hasClip && state === 'failed')
+  const step3Done = state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || (hasClip && (state === 'failed' || state === 'unavailable'))
   const step3Current = state === 'recording'
 
   const step4Done = state === 'success'

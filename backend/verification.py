@@ -86,9 +86,83 @@ def providers_available() -> bool:
     return bool(diag["face"] and diag["liveness"] and diag["speech"] and diag["video_decode"])
 
 
+def _facenet_weights_path() -> Path:
+    home = Path(os.getenv("DEEPFACE_HOME", default=os.path.expanduser("~")))
+    return home / ".deepface" / "weights" / "facenet_weights.h5"
+
+
+def _ensure_facenet_weights() -> None:
+    """Ensure facenet_weights.h5 is cached locally on disk so inference never stalls downloading."""
+    target = _facenet_weights_path()
+    if target.exists() and target.stat().st_size >= 90_000_000:
+        return
+
+    bundled = Path(__file__).resolve().parent / "weights" / "facenet_weights.h5"
+    if bundled.exists() and bundled.stat().st_size >= 90_000_000:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            import shutil
+            shutil.copyfile(str(bundled), str(target))
+            logger.info("[WEIGHTS] Copied bundled facenet_weights.h5 to %s", target)
+            return
+        except Exception as exc:
+            logger.warning("[WEIGHTS] Could not copy bundled weights: %s", exc)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("[WEIGHTS] Downloading facenet_weights.h5 from HuggingFace CDN...")
+    hf_url = "https://huggingface.co/junjiang/GestureFace/resolve/main/facenet_weights.h5"
+    temp_target = target.with_suffix(".tmp")
+    try:
+        import httpx
+        with httpx.Client(verify=False, follow_redirects=True, timeout=60.0) as client:
+            with client.stream("GET", hf_url) as resp:
+                resp.raise_for_status()
+                with open(temp_target, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+        if temp_target.stat().st_size >= 90_000_000:
+            temp_target.replace(target)
+            logger.info("[WEIGHTS] Successfully downloaded and cached facenet_weights.h5 (%d bytes)", target.stat().st_size)
+            return
+    except Exception as exc:
+        logger.warning("[WEIGHTS] HuggingFace CDN download failed (%s); trying fallback GitHub URL...", exc)
+        if temp_target.exists():
+            try:
+                temp_target.unlink()
+            except OSError:
+                pass
+
+    gh_url = "https://github.com/serengil/deepface_models/releases/download/v1.0/facenet_weights.h5"
+    try:
+        import httpx
+        with httpx.Client(verify=False, follow_redirects=True, timeout=120.0) as client:
+            with client.stream("GET", gh_url) as resp:
+                resp.raise_for_status()
+                with open(temp_target, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+        if temp_target.stat().st_size >= 90_000_000:
+            temp_target.replace(target)
+            logger.info("[WEIGHTS] Successfully downloaded facenet_weights.h5 from fallback (%d bytes)", target.stat().st_size)
+    except Exception as fallback_exc:
+        logger.error("[WEIGHTS] All weight download sources failed: %s", fallback_exc)
+
+
 def preload_verification_models() -> None:
-    """Preload is lightweight to prevent cold-boot memory spikes on Render."""
-    logger.info("Verification models configured and ready for on-demand processing.")
+    """Preload models on server boot in a background thread so runtime verification is instantaneous."""
+    def _warmup():
+        try:
+            logger.info("[PRELOAD] Starting background verification models warmup...")
+            _ensure_facenet_weights()
+            _ = _speech_model()
+            logger.info("[PRELOAD] Verification models preloaded and ready.")
+        except Exception as exc:
+            logger.warning("[PRELOAD] Background warmup warning: %s", exc)
+
+    thread = threading.Thread(target=_warmup, name="VerificationPreload", daemon=True)
+    thread.start()
 
 
 def _sampled_indexes(count: int) -> list[int]:
@@ -136,11 +210,12 @@ def _frames_from_av(video_path: Path) -> list:
         logger.info("[DECODE] PyAV opened video: codec=%s, resolution=%dx%d, duration=%.2fs", codec_name, width, height, duration)
         print(f"[DECODE] PyAV opened video: codec={codec_name}, resolution={width}x{height}, duration={duration:.2f}s", flush=True)
 
-        # Single streaming pass: sample 8 frames spaced across the stream without 2x decoding
+        # Single streaming pass: sample ~8-10 frames evenly spaced across the entire clip
+        # Targets indices spanning from 0.4s to 11s to cover the full speaking clip
+        sample_indices = {12, 36, 72, 108, 144, 180, 216, 252, 288, 324}
         frame_idx = 0
         for frame in container.decode(video=0):
-            # Target ~8 frames across clip: sample every 24 frames or initial anchors
-            if frame_idx % 24 == 0 or frame_idx in (8, 20):
+            if frame_idx in sample_indices or (frame_idx > 324 and frame_idx % 36 == 0):
                 array = _array_from_av_frame(frame)
                 if array is not None:
                     h, w = array.shape[:2]
@@ -148,7 +223,7 @@ def _frames_from_av(video_path: Path) -> list:
                         scale = 640.0 / max(h, w)
                         array = cv2.resize(array, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
                     frames.append(array)
-                    if len(frames) >= 8:
+                    if len(frames) >= 10:
                         break
             frame_idx += 1
 
@@ -169,9 +244,10 @@ def _frames_from_cv2(video_path: Path, cv2) -> list:
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
         frames = []
+        sample_indices = {12, 36, 72, 108, 144, 180, 216, 252, 288, 324}
         frame_idx = 0
-        while len(frames) < 8 and frame_idx < 350:
-            if frame_idx % 24 == 0 or frame_idx in (8, 20):
+        while len(frames) < 10 and frame_idx < 400:
+            if frame_idx in sample_indices or (frame_idx > 324 and frame_idx % 36 == 0):
                 success, frame = capture.read()
                 if not success or frame is None:
                     break
@@ -383,8 +459,9 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
         rects = c_primary.detectMultiScale(
             clahe_gray, scaleFactor=1.12, minNeighbors=4, minSize=(MIN_FACE_PX, MIN_FACE_PX)
         )
-        if len(rects) > 0:
-            return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+        valid = [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+        if valid:
+            return valid
 
     # Fast Pass 2: Secondary frontal cascade (alt2) on CLAHE
     c_alt2 = _get_cascade("haarcascade_frontalface_alt2.xml", cv2)
@@ -392,8 +469,9 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
         rects = c_alt2.detectMultiScale(
             clahe_gray, scaleFactor=1.12, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
         )
-        if len(rects) > 0:
-            return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+        valid = [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+        if valid:
+            return valid
 
     # Fallback Pass 3: Profile face cascade for reading head tilt
     c_prof = _get_cascade("haarcascade_profileface.xml", cv2)
@@ -401,8 +479,9 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
         rects = c_prof.detectMultiScale(
             clahe_gray, scaleFactor=1.12, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
         )
-        if len(rects) > 0:
-            return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+        valid = [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+        if valid:
+            return valid
 
     # Fallback Pass 4: Global equalized histogram if lighting is uneven
     equalized = cv2.equalizeHist(gray)
@@ -410,8 +489,9 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
         rects = c_primary.detectMultiScale(
             equalized, scaleFactor=1.12, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
         )
-        if len(rects) > 0:
-            return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+        valid = [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+        if valid:
+            return valid
 
     return []
 
@@ -472,7 +552,7 @@ def _embedding_from_crop(DeepFace, face_crop):
             if embedding and len(embedding) >= 128:
                 return embedding
     except Exception as exc:
-        logger.debug("Crop embedding direct array failed: %s", exc)
+        logger.warning("Crop embedding direct array failed: %s", exc)
 
     # Fallback via temp image file
     try:
@@ -498,7 +578,7 @@ def _embedding_from_crop(DeepFace, face_crop):
             except OSError:
                 pass
     except Exception as exc:
-        logger.debug("Crop embedding via temp file failed: %s", exc)
+        logger.warning("Crop embedding via temp file failed: %s", exc)
 
     return None
 
@@ -573,14 +653,9 @@ def _compare_face_to_enrollment(DeepFace, cv2, face_frame, enrollment_frames: li
 def _enrollment_embeddings(DeepFace, cv2, enrollment_images: list) -> list:
     """Extract embeddings from enrollment images using the unified crop pipeline."""
     embeddings = []
-    # If 5 images are enrolled, select 3 representative ones (first, middle, last)
-    # to dramatically reduce cold-cache embedding calculation time from 20s to ~7s on CPU.
-    if len(enrollment_images) >= 5:
-        selected = [enrollment_images[0], enrollment_images[len(enrollment_images) // 2], enrollment_images[-1]]
-    else:
-        selected = enrollment_images
-
-    for ref_img in selected:
+    for ref_img in enrollment_images:
+        if len(embeddings) >= 3:
+            break
         if ref_img is None or getattr(ref_img, "size", 0) == 0:
             continue
         rects = _detect_faces_opencv(ref_img, cv2)
@@ -660,6 +735,7 @@ def _save_cached_enrollment_embeddings(cache_key: str, embeddings: list) -> None
 
 def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) -> dict:
     """Evaluate face match and liveness in an isolated worker process."""
+    _ensure_facenet_weights()
     try:
         import cv2
         logger.info("[MODEL] Loading FaceNet...")
@@ -825,6 +901,7 @@ def _run_speech_subprocess(video_path: Path) -> str:
         "import sys, os\n"
         "os.environ['PYTHONIOENCODING'] = 'utf-8'\n"
         "os.environ['PYTHONUTF8'] = '1'\n"
+        "os.environ['OMP_NUM_THREADS'] = '1'\n"
         f"for d in ('{file_dir}', '{root_dir}'):\n"
         "    if d not in sys.path: sys.path.insert(0, d)\n"
         "from pathlib import Path\n"
@@ -838,6 +915,7 @@ def _run_speech_subprocess(video_path: Path) -> str:
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    env["OMP_NUM_THREADS"] = "1"
     env["PYTHONPATH"] = f"{file_dir}{os.pathsep}{root_dir}"
     try:
         proc = subprocess.run(
@@ -863,16 +941,23 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
     file_dir = str(Path(__file__).resolve().parent).replace("\\", "/")
     root_dir = str(Path(__file__).resolve().parent.parent).replace("\\", "/")
 
+    _ensure_facenet_weights()
+
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
         json.dump(encoded_samples, f)
         samples_file = f.name
 
+    deepface_home = str(Path.home()).replace("\\", "/")
     script = (
         "import sys, os, json, traceback\n"
         "os.environ['PYTHONIOENCODING'] = 'utf-8'\n"
         "os.environ['PYTHONUTF8'] = '1'\n"
         "os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'\n"
         "os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'\n"
+        "os.environ['OMP_NUM_THREADS'] = '1'\n"
+        "os.environ['TF_NUM_INTRAOP_THREADS'] = '1'\n"
+        "os.environ['TF_NUM_INTEROP_THREADS'] = '1'\n"
+        f"os.environ['DEEPFACE_HOME'] = r'{deepface_home}'\n"
         "if hasattr(sys.stdout, 'reconfigure'):\n"
         "    sys.stdout.reconfigure(encoding='utf-8')\n"
         f"for d in ('{file_dir}', '{root_dir}'):\n"
@@ -897,6 +982,10 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
     env["PYTHONUTF8"] = "1"
     env["TF_CPP_MIN_LOG_LEVEL"] = "3"
     env["TF_ENABLE_ONEDNN_OPTS"] = "0"
+    env["OMP_NUM_THREADS"] = "1"
+    env["TF_NUM_INTRAOP_THREADS"] = "1"
+    env["TF_NUM_INTEROP_THREADS"] = "1"
+    env["DEEPFACE_HOME"] = str(Path.home())
     env["PYTHONPATH"] = f"{file_dir}{os.pathsep}{root_dir}"
     try:
         proc = subprocess.run(

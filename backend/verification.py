@@ -12,6 +12,11 @@ from pathlib import Path
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["PYTHONUTF8"] = "1"
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -42,75 +47,33 @@ class VerificationUnavailable(RuntimeError):
 
 
 def verification_diagnostics() -> dict:
-    """Inspect availability of individual verification subsystems."""
+    """Inspect availability of individual verification subsystems without loading heavy ML weights."""
+    from importlib.util import find_spec
+
     engine = os.getenv(
         "DEEPFACE_BACKEND_ENGINE",
         os.getenv("CLOUDGUARD_DEEPFACE_ENGINE", "tensorflow"),
     ).lower()
-    engine_module = {"tensorflow": "tensorflow", "pytorch": "torch"}.get(engine)
+    engine_module = {"tensorflow": "tensorflow", "pytorch": "torch"}.get(engine, "tensorflow")
 
-    has_engine = False
-    has_cv2 = False
-    has_deepface = False
-    has_tf_keras = False
-    has_whisper = False
-    has_av = False
-    err_detail = {}
-
-    try:
-        import av
-        has_av = True
-    except Exception as exc:
-        err_detail["av"] = str(exc)
-
-    try:
-        import cv2
-        has_cv2 = True
-    except Exception as exc:
-        err_detail["cv2"] = str(exc)
-
-    try:
-        import faster_whisper
-        has_whisper = True
-    except Exception as exc:
-        err_detail["faster_whisper"] = str(exc)
-
-    try:
-        import tf_keras
-        has_tf_keras = True
-    except Exception as exc:
-        err_detail["tf_keras"] = str(exc)
-
-    try:
-        if engine_module == "tensorflow":
-            import tensorflow
-            has_engine = True
-        elif engine_module == "torch":
-            import torch
-            has_engine = True
-    except Exception as exc:
-        err_detail["engine"] = str(exc)
-
-    try:
-        from deepface import DeepFace
-        has_deepface = True
-    except Exception as exc:
-        err_detail["deepface"] = str(exc)
+    has_av = find_spec("av") is not None
+    has_cv2 = find_spec("cv2") is not None
+    has_whisper = find_spec("faster_whisper") is not None
+    has_tf_keras = find_spec("tf_keras") is not None
+    has_deepface = find_spec("deepface") is not None
+    has_engine = find_spec(engine_module) is not None
 
     face_ready = bool(has_cv2 and has_deepface and has_tf_keras and has_engine)
     liveness_ready = bool(face_ready)
     speech_ready = bool(has_whisper)
     video_ready = bool(has_av or has_cv2)
 
-    res = {
+    return {
         "face": face_ready,
         "liveness": liveness_ready,
         "speech": speech_ready,
         "video_decode": video_ready,
     }
-    if err_detail:
-        res["errors"] = err_detail
-    return res
 
 
 def providers_available() -> bool:
@@ -119,24 +82,8 @@ def providers_available() -> bool:
 
 
 def preload_verification_models() -> None:
-    """Pre-warm Whisper and DeepFace models so the first check-in does not encounter a cold-load delay."""
-    if not providers_available():
-        logger.info("Verification dependencies unavailable; skipping model preload.")
-        return
-    try:
-        logger.info("Pre-warming speech model (%s)...", _whisper_model_name())
-        _speech_model()
-        logger.info("Speech model pre-warmed successfully.")
-    except Exception as exc:
-        logger.warning("Could not pre-warm speech model: %s", exc)
-
-    try:
-        from deepface import DeepFace
-        logger.info("Pre-warming DeepFace %s model...", FACE_MODEL)
-        DeepFace.build_model(FACE_MODEL)
-        logger.info("DeepFace %s model pre-warmed successfully.", FACE_MODEL)
-    except Exception as exc:
-        logger.warning("Could not pre-warm DeepFace model: %s", exc)
+    """Preload is lightweight to prevent cold-boot memory spikes on Render."""
+    logger.info("Verification models configured and ready for on-demand processing.")
 
 
 def _sampled_indexes(count: int) -> list[int]:
@@ -571,13 +518,17 @@ def verify_recording(
         frames = [_shrink_frame(frame, cv2) for frame in _video_frames(video_path, cv2)]
         enrollment_images = [_shrink_frame(image, cv2) for image in _enrollment_images(encoded_samples, cv2)]
 
-        speech_holder: dict = {"text": ""}
-        speech_thread = threading.Thread(
-            target=lambda: speech_holder.__setitem__("text", _transcribe_recording(video_path)),
-            daemon=True,
-        )
-        speech_thread.start()
+        # 1. Speech transcription executed first to avoid concurrent peak RAM usage
+        transcript = ""
+        try:
+            transcript = _transcribe_recording(video_path)
+        except Exception as exc:
+            logger.warning("Speech transcription error: %s", exc)
 
+        import gc
+        gc.collect()
+
+        # 2. Face enrollment embeddings and live verification
         enrollment_vectors = _enrollment_embeddings(DeepFace, cv2, enrollment_images)
 
         liveness_votes = 0
@@ -621,12 +572,7 @@ def verify_recording(
             if _identity_matches_enrollment(live_embedding, enrollment_vectors):
                 identity_votes += 1
 
-        speech_thread.join(timeout=_TRANSCRIBE_SECONDS)
-        if speech_thread.is_alive():
-            logger.warning("Whisper transcription timed out after %ss.", _TRANSCRIBE_SECONDS)
-            transcript = ""
-        else:
-            transcript = speech_holder.get("text") or ""
+        gc.collect()
 
         # ── Thresholds ───────────────────────────────────────────────────────────
         # Require at least 1 liveness vote out of collected frames (lenient – the

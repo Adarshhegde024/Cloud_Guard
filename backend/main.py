@@ -95,9 +95,8 @@ async def lifespan(_: FastAPI):
     except Exception as error:
         logger.warning(f"Initial DB check warning: {error}")
     scheduler_task = asyncio.create_task(run_background_scheduler())
-    if providers_available():
-        import threading
-        threading.Thread(target=preload_verification_models, daemon=True, name="model-preload").start()
+    # Models are loaded on-demand to conserve RAM on resource-constrained deployments
+    preload_verification_models()
     try:
         yield
     finally:

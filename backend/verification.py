@@ -742,15 +742,31 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
         if enrollment_vectors:
             _save_cached_enrollment_embeddings(cache_key, enrollment_vectors)
 
+    # Select up to 4 representative, evenly-spaced face crops across the recording
+    # to avoid redundant CPU inference loops while maintaining high identity verification accuracy.
+    if len(face_crops) <= 4:
+        selected_crops = face_crops
+    else:
+        step = len(face_crops) / 4.0
+        indices = [int(i * step) for i in range(4)]
+        selected_crops = [face_crops[min(idx, len(face_crops) - 1)] for idx in indices]
+
+    # Target threshold for early confirmation (at least 35% of selected frames)
+    target_threshold = max(1, math.ceil(len(selected_crops) * 0.35))
+
     identity_votes = 0
     frames_attempted = 0
-    for crop in face_crops:
+    for crop in selected_crops:
         emb = _embedding_from_crop(DeepFace, crop)
         if emb is None:
             continue
         frames_attempted += 1
         if _identity_matches_enrollment(emb, enrollment_vectors):
             identity_votes += 1
+            if identity_votes >= target_threshold:
+                logger.info("[FACE] Identity confirmed with %d positive votes (target: %d). Early exit.", identity_votes, target_threshold)
+                print(f"[FACE] Identity confirmed with {identity_votes} positive votes (target: {target_threshold}). Early exit.", flush=True)
+                break
 
     if frames_attempted == 0:
         face_status = "failed"
@@ -810,7 +826,7 @@ def _run_speech_subprocess(video_path: Path) -> str:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=25,
+            timeout=45,
         )
         for line in proc.stdout.splitlines():
             if line.startswith("__TRANSCRIPT__:"):
@@ -869,7 +885,7 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
             encoding="utf-8",
             errors="replace",
             env=env,
-            timeout=85,
+            timeout=95,
         )
         face_result = None
         worker_error = None

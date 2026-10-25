@@ -3206,7 +3206,7 @@ function Checkin({ token, onComplete, onNavigate }) {
         console.log(`[CHECKIN] job id: ${jobId}`)
         setState('processing')
         const pollStartTime = Date.now()
-        const maxWaitMs = 120000
+        const maxWaitMs = 180000
         while (Date.now() - pollStartTime < maxWaitMs) {
           await new Promise((resolve) => setTimeout(resolve, 2000))
           try {

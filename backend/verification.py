@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 FACE_MODEL = "Facenet"
 # Robust face matching distance threshold (DeepFace Facenet cosine distance)
 # 0.28 admits authentic enrolled owners across natural variations while blocking different angles/persons.
-FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.28"))
+FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.38"))
 MIN_FACE_PX = 24
 MAX_FACE_FRAME_COVERAGE = 0.85
 # Sample 16 frames spanning the full 12s recording (every ~0.75s)
@@ -44,7 +44,7 @@ _FRAME_SAMPLE_FRACTIONS = (
     0.06, 0.12, 0.18, 0.24, 0.30, 0.36, 0.42, 0.48,
     0.54, 0.60, 0.66, 0.72, 0.78, 0.84, 0.90, 0.94
 )
-_MAX_FRAME_SIDE = 960
+_MAX_FRAME_SIDE = 640
 _TRANSCRIBE_SECONDS = 35
 
 
@@ -119,6 +119,7 @@ def _array_from_av_frame(frame) -> np.ndarray | None:
 def _frames_from_av(video_path: Path) -> list:
     import av
 
+    duration = 0.0
     with av.open(str(video_path)) as container:
         if not container.streams.video:
             raise ValueError("The recording could not be opened. Please record again.")
@@ -126,7 +127,6 @@ def _frames_from_av(video_path: Path) -> list:
         width = getattr(stream.codec_context, "width", None) or getattr(stream, "width", 0)
         height = getattr(stream.codec_context, "height", None) or getattr(stream, "height", 0)
         codec_name = getattr(stream.codec_context, "name", None) or getattr(stream, "name", "unknown")
-        duration = 0.0
         if container.duration is not None:
             duration = float(container.duration) / av.time_base
         elif stream.duration is not None and stream.time_base is not None:
@@ -135,28 +135,40 @@ def _frames_from_av(video_path: Path) -> list:
         logger.info("[DECODE] PyAV opened video: codec=%s, resolution=%dx%d, duration=%.2fs", codec_name, width, height, duration)
         print(f"[DECODE] PyAV opened video: codec={codec_name}, resolution={width}x{height}, duration={duration:.2f}s", flush=True)
 
-        all_video_frames = []
-        for index, frame in enumerate(container.decode(video=0)):
-            if index > 450:
+        # Pass 1: Fast frame count without retaining frame objects in memory (avoids OOM on 512MB RAM)
+        total = 0
+        for _ in container.decode(video=0):
+            total += 1
+            if total > 450:
                 break
-            all_video_frames.append(frame)
 
-        if len(all_video_frames) < 2:
-            raise ValueError("The recording could not be decoded reliably. Please record again.")
+    if total < 2:
+        raise ValueError("The recording could not be decoded reliably. Please record again.")
 
-        total = len(all_video_frames)
-        target_idxs = sorted(set(max(0, min(total - 1, int(total * fr))) for fr in _FRAME_SAMPLE_FRACTIONS))
-        frames = []
-        for idx in target_idxs:
-            array = _array_from_av_frame(all_video_frames[idx])
-            if array is not None:
-                frames.append(array)
+    target_idxs = set(sorted(set(max(0, min(total - 1, int(total * fr))) for fr in _FRAME_SAMPLE_FRACTIONS)))
+    max_target = max(target_idxs)
 
-        if len(frames) < 2:
-            raise ValueError("The recording could not be decoded reliably. Please record again.")
-        logger.info("[DECODE] PyAV decoded %d frames, sampled %d frames across video", total, len(frames))
-        print(f"[DECODE] PyAV decoded {total} frames, sampled {len(frames)} frames across video", flush=True)
-        return frames
+    # Pass 2: Stream through and extract only the target sample frames
+    frames = []
+    with av.open(str(video_path)) as container:
+        for idx, frame in enumerate(container.decode(video=0)):
+            if idx in target_idxs:
+                array = _array_from_av_frame(frame)
+                if array is not None:
+                    h, w = array.shape[:2]
+                    if max(h, w) > 640:
+                        import cv2
+                        scale = 640.0 / max(h, w)
+                        array = cv2.resize(array, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+                    frames.append(array)
+            if idx > max_target:
+                break
+
+    if len(frames) < 2:
+        raise ValueError("The recording could not be decoded reliably. Please record again.")
+    logger.info("[DECODE] PyAV sampled %d frames across video (total frames: %d)", len(frames), total)
+    print(f"[DECODE] PyAV sampled {len(frames)} frames across video (total frames: {total})", flush=True)
+    return frames
 
 
 def _frames_from_cv2(video_path: Path, cv2) -> list:
@@ -165,28 +177,50 @@ def _frames_from_cv2(video_path: Path, cv2) -> list:
         if not capture.isOpened():
             raise ValueError("The recording could not be opened. Please record again.")
 
-        all_frames = []
-        index = 0
-        while index < 450:
-            success, frame = capture.read()
-            if not success or frame is None:
-                break
-            all_frames.append(frame)
-            index += 1
-
-        if len(all_frames) < 2:
-            raise ValueError("The recording could not be decoded reliably. Please record again.")
-
-        total = len(all_frames)
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        target_idxs = sorted(set(max(0, min(total - 1, int(total * fr))) for fr in _FRAME_SAMPLE_FRACTIONS))
-        frames = [all_frames[i].copy() for i in target_idxs if all_frames[i] is not None and all_frames[i].size]
+
+        # Determine total frames using fast grab() without allocating full-frame numpy arrays
+        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total <= 0:
+            count = 0
+            while count < 450:
+                success = capture.grab()
+                if not success:
+                    break
+                count += 1
+            total = count
+            capture.release()
+            capture = cv2.VideoCapture(str(video_path))
+
+        if total < 2:
+            raise ValueError("The recording could not be decoded reliably. Please record again.")
+
+        target_idxs = set(sorted(set(max(0, min(total - 1, int(total * fr))) for fr in _FRAME_SAMPLE_FRACTIONS)))
+        max_target = max(target_idxs)
+
+        frames = []
+        curr_idx = 0
+        while curr_idx <= max_target and curr_idx < 450:
+            if curr_idx in target_idxs:
+                success, frame = capture.read()
+                if not success or frame is None:
+                    break
+                h, w = frame.shape[:2]
+                if max(h, w) > 640:
+                    scale = 640.0 / max(h, w)
+                    frame = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+                frames.append(frame)
+            else:
+                success = capture.grab()
+                if not success:
+                    break
+            curr_idx += 1
 
         if len(frames) < 2:
             raise ValueError("The recording could not be decoded reliably. Please record again.")
-        logger.info("[DECODE] OpenCV decoded %d frames (%dx%d), sampled %d frames", total, width, height, len(frames))
-        print(f"[DECODE] OpenCV decoded {total} frames ({width}x{height}), sampled {len(frames)} frames", flush=True)
+        logger.info("[DECODE] OpenCV sampled %d frames (total frames: %d, %dx%d)", len(frames), total, width, height)
+        print(f"[DECODE] OpenCV sampled {len(frames)} frames (total frames: {total}, {width}x{height})", flush=True)
         return frames
     finally:
         capture.release()

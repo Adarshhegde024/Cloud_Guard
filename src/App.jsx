@@ -1258,7 +1258,7 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
     try {
       stopEnrollmentCamera()
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24, max: 30 } },
         audio: false,
       })
       streamRef.current = stream
@@ -3066,7 +3066,12 @@ function Checkin({ token, onComplete, onNavigate }) {
         ? ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4']
             .find((type) => MediaRecorder.isTypeSupported(type))
         : undefined
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined)
+      const recorderOptions = {
+        videoBitsPerSecond: 800000,
+        audioBitsPerSecond: 64000,
+      }
+      if (mimeType) recorderOptions.mimeType = mimeType
+      const recorder = new MediaRecorder(stream, recorderOptions)
       recorderRef.current = recorder
       recordingChunks.current = []
       recordingClip.current = null
@@ -3170,7 +3175,7 @@ function Checkin({ token, onComplete, onNavigate }) {
           token,
           method: 'POST',
           body: form,
-          timeoutMs: 30000,
+          timeoutMs: 90000,
         })
       } catch (startErr) {
         if (startErr.status === 404) {
@@ -3178,7 +3183,7 @@ function Checkin({ token, onComplete, onNavigate }) {
             token,
             method: 'POST',
             body: form,
-            timeoutMs: 30000,
+            timeoutMs: 90000,
           })
         } else {
           throw startErr
@@ -3306,9 +3311,20 @@ function Checkin({ token, onComplete, onNavigate }) {
 
       if (isUnavailable) {
         setState('unavailable')
+        let msg = errData.message
+        if (!msg) {
+          if (requestError.name === 'TimeoutError' || requestError.message?.includes('taking too long')) {
+            msg = 'Verification request timed out. Please check your network connection and try again.'
+          } else if (status === 502 || status === 504) {
+            msg = 'Verification server took too long to respond. Please try again.'
+          } else {
+            msg = 'Verification service is temporarily unavailable. No check-in was recorded. Please try again.'
+          }
+        }
         setVerificationResult({
           status: 'unavailable',
-          message: errData.message || 'Verification service is temporarily unavailable. No check-in was recorded. Please try again.',
+          message: msg,
+          failureReason: requestError.message || undefined,
           checks: { face: 'unavailable', liveness: 'unavailable', voice: 'unavailable' },
         })
       } else {
@@ -3616,6 +3632,11 @@ function Checkin({ token, onComplete, onNavigate }) {
               <span className="eyebrow">VERIFICATION UNAVAILABLE</span>
               <h3>Live verification services are currently unavailable.</h3>
               <p>{verificationResult.message}</p>
+              {verificationResult.failureReason && (
+                <p style={{ fontSize: '13px', color: 'var(--text-secondary, #64748b)', marginTop: '4px' }}>
+                  Details: {verificationResult.failureReason}
+                </p>
+              )}
               <div className="result-checks">
                 <div><span>Face matching</span><b className="unavailable-status">Unavailable</b></div>
                 <div><span>Anti-spoof liveness</span><b className="unavailable-status">Unavailable</b></div>

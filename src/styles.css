@@ -428,6 +428,11 @@ input:disabled { background: #f8f8fb; color: #858b98; }
 .checkin-flow > .button { min-height: 39px; font-size: 10px; }
 .checkin-video { display: none; width: 100%; max-height: 250px; margin: 13px 0; border-radius: 11px; background: #21232d; object-fit: cover; transform: scaleX(-1); }
 .checkin-video.video-visible { display: block; }
+.checkin-badges { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.checkin-badge { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+.checkin-badge-ready { background: #eef7f2; color: #2b7a4b; border: 1px solid #c7e8d6; }
+.checkin-badge-recording { background: #fdf2f2; color: #c53030; border: 1px solid #fed7d7; }
+.checkin-guidance { font-size: 11px; color: #64748b; margin: 6px 0 12px; line-height: 1.5; }
 .phrase-panel { margin-top: 16px; padding: 16px; border: 1px solid #ecebfa; border-radius: 12px; background: #fbfaff; }
 .phrase-panel p { margin: 8px 0 17px; color: #42465a; font: 600 19px/1.5 Manrope; letter-spacing: -.5px; }
 .phrase-panel .button { min-height: 37px; font-size: 10px; }

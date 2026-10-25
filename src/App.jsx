@@ -1518,7 +1518,7 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
                 </span>
               </label>
               <div className="enrollment-card">
-                <div className="enrollment-heading"><span className="mini-icon"><Icon name="scan" size={17} /></span><span><b>Face enrollment</b><small>Capture five face samples for your secure profile.</small></span><span className={`sample-count ${faceSamples.length === 5 ? 'sample-count-done' : ''}`}>{faceSamples.length}/5</span></div>
+                <div className="enrollment-heading"><span className="mini-icon"><Icon name="scan" size={17} /></span><span><b>Face enrollment</b><small>Capture 5 face samples for your secure profile.</small></span><span className={`sample-count ${faceSamples.length === 5 ? 'sample-count-done' : ''}`}>{faceSamples.length}/5</span></div>
                 <div className={`enrollment-camera ${cameraOpen ? 'enrollment-camera-active' : 'enrollment-camera-idle'}`}>
                   <div className="enrollment-preview">
                     <video className="enrollment-live-video" ref={videoRef} muted playsInline />
@@ -1538,7 +1538,40 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
                   <button type="button" className="button button-secondary button-small" onClick={openEnrollmentCamera}>Open camera</button>
                 </div>}
                 {faceSamples.length > 0 && <div className="sample-strip">
-                  {faceSamples.map((sample, index) => <div className="sample-thumb" key={`${index}-${sample.length}`}><img src={sample} alt={`Face enrollment sample ${index + 1}`} /><span>{String(index + 1).padStart(2, '0')}</span></div>)}
+                  {faceSamples.map((sample, index) => (
+                    <div className="sample-thumb" key={`${index}-${sample.length}`} style={{ position: 'relative' }}>
+                      <img src={sample} alt={`Face enrollment sample ${index + 1}`} />
+                      <span>{String(index + 1).padStart(2, '0')}</span>
+                      <button
+                        type="button"
+                        className="sample-remove-btn"
+                        title="Remove sample"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setFaceSamples((prev) => prev.filter((_, i) => i !== index))
+                        }}
+                        style={{
+                          position: 'absolute',
+                          top: '2px',
+                          right: '2px',
+                          width: '16px',
+                          height: '16px',
+                          borderRadius: '50%',
+                          background: 'rgba(0,0,0,0.6)',
+                          color: '#fff',
+                          border: 'none',
+                          fontSize: '11px',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          lineHeight: 1,
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
                   {faceSamples.length === 5 && <button type="button" className="text-button recapture-button" onClick={() => { setFaceSamples([]); setCaptureProgress(0); openEnrollmentCamera() }}>Retake all</button>}
                 </div>}
               </div>
@@ -1546,7 +1579,7 @@ function AuthScreen({ onLogin, onRecipientLogin, onNomineeLogin, onReviewerLogin
             </>}
             {mode === 'login' && <div className="form-meta"><span>Secure access to your personal vault</span><span className="secure-label"><Icon name="lock" size={13} /> ENCRYPTED</span></div>}
             {mode.endsWith('-login') && <div className="form-meta"><span>{mode === 'nominee-login' ? 'Case submission only; no document access' : mode === 'reviewer-login' ? 'Case review only; no document access' : 'Documents stay locked until approved release'}</span><span className="secure-label"><Icon name="lock" size={13} /> RESTRICTED</span></div>}
-            <button className="button button-primary button-full" type="submit" disabled={loading}>{loading ? 'Please wait...' : mode === 'register' ? 'Create secure account' : 'Sign in'}<Icon name="arrow" size={17} /></button>
+            <button className="button button-primary button-full" type="submit" disabled={loading || (mode === 'register' && faceSamples.length !== 5)}>{loading ? 'Please wait...' : mode === 'register' ? 'Create secure account' : 'Sign in'}<Icon name="arrow" size={17} /></button>
           </form>
           <p className="auth-switch">{mode === 'login' ? 'New to CloudGuard?' : mode === 'register' ? 'Already have a CloudGuard account?' : 'Use a different sign-in role?'} <button type="button" onClick={() => { setMode(mode === 'login' ? 'register' : 'login'); setError(''); setNotice('') }}>{mode === 'login' ? 'Create an account' : 'Owner sign in'}</button></p>
           {mode !== 'register' && <div className="auth-role-links">
@@ -2788,7 +2821,7 @@ function Checkin({ token, onComplete, onNavigate }) {
   const recorderRef = useRef(null)
   const timerRef = useRef(null)
 
-  // Explicit state management: 'idle' | 'recording' | 'recorded' | 'submitting' | 'success' | 'failed' | 'unavailable'
+  // Explicit state management: 'idle' | 'permission_request' | 'ready' | 'recording' | 'recorded' | 'submitting' | 'processing' | 'success' | 'failed' | 'unavailable'
   const [state, setState] = useState('idle')
   const [streamOn, setStreamOn] = useState(false)
   const [seconds, setSeconds] = useState(12)
@@ -2822,11 +2855,13 @@ function Checkin({ token, onComplete, onNavigate }) {
     return () => { active = false }
   }, [])
 
-  async function openCamera() {
+  async function requestPermissions() {
     setError('')
     setVerificationResult(null)
+    setState('permission_request')
     if (!navigator.mediaDevices?.getUserMedia) {
-      setError('Camera access needs a secure browser context (HTTPS or localhost).')
+      setError('Camera and microphone access require a secure browser context (HTTPS or localhost).')
+      setState('idle')
       return
     }
     try {
@@ -2834,16 +2869,62 @@ function Checkin({ token, onComplete, onNavigate }) {
         video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: { echoCancellation: true, noiseSuppression: true },
       })
+      const videoTracks = stream.getVideoTracks()
+      const audioTracks = stream.getAudioTracks()
+      if (videoTracks.length === 0 || videoTracks[0].readyState !== 'live') {
+        stream.getTracks().forEach((t) => t.stop())
+        throw new Error('Camera access is required for face matching and liveness verification.')
+      }
+      if (audioTracks.length === 0 || audioTracks[0].readyState !== 'live') {
+        stream.getTracks().forEach((t) => t.stop())
+        throw new Error('Microphone access is required for spoken phrase verification.')
+      }
+
       streamRef.current = stream
       if (videoRef.current) {
         videoRef.current.srcObject = stream
-        await videoRef.current.play()
+        await videoRef.current.play().catch(() => {})
       }
       setStreamOn(true)
-      setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
+
+      // Fetch a phrase from the server or use a random one from SENTENCES
+      try {
+        const phraseRes = await api('/check-ins/phrase', { timeoutMs: 5000 })
+        if (phraseRes?.sentence) {
+          setSentence(phraseRes.sentence)
+        } else {
+          setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
+        }
+      } catch {
+        setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
+      }
+      setState('ready')
+    } catch (permError) {
+      console.error('Check-in permission error:', permError)
+      let camOk = false
+      let micOk = false
+      try {
+        const v = await navigator.mediaDevices.getUserMedia({ video: true })
+        v.getTracks().forEach((t) => t.stop())
+        camOk = true
+      } catch {}
+      try {
+        const a = await navigator.mediaDevices.getUserMedia({ audio: true })
+        a.getTracks().forEach((t) => t.stop())
+        micOk = true
+      } catch {}
+
+      if (!camOk && micOk) {
+        setError('Camera access is required for face matching and liveness verification. Please allow camera access in your browser.')
+      } else if (camOk && !micOk) {
+        setError('Microphone access is required for spoken phrase verification. Please allow microphone access in your browser.')
+      } else {
+        setError(permError.message && !permError.message.includes('object')
+          ? permError.message
+          : 'Camera and microphone access are required to perform a live check-in. Please allow permissions in your browser and try again.')
+      }
+      setStreamOn(false)
       setState('idle')
-    } catch {
-      setError('Please allow camera and microphone access in your browser to continue.')
     }
   }
 
@@ -2855,6 +2936,15 @@ function Checkin({ token, onComplete, onNavigate }) {
       setError('This browser cannot record a check-in. Try the latest version of Chrome, Edge or Firefox.')
       return
     }
+
+    const vTrack = stream.getVideoTracks()[0]
+    const aTrack = stream.getAudioTracks()[0]
+    if (!vTrack || vTrack.readyState !== 'live' || !aTrack || aTrack.readyState !== 'live') {
+      setError('Camera or microphone disconnected. Please click "Allow camera & microphone" again.')
+      stopCamera()
+      return
+    }
+
     try {
       const mimeType = typeof MediaRecorder.isTypeSupported === 'function'
         ? ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4']
@@ -2866,49 +2956,78 @@ function Checkin({ token, onComplete, onNavigate }) {
       recordingClip.current = null
       setHasClip(false)
       recorder.ondataavailable = (event) => {
-        if (event.data.size) recordingChunks.current.push(event.data)
+        if (event.data && event.data.size > 0) recordingChunks.current.push(event.data)
       }
       recorder.onstop = () => {
         const clip = new Blob(recordingChunks.current, { type: recorder.mimeType || 'video/webm' })
         recordingClip.current = clip
-        setHasClip(clip.size > 0)
-        setState('recorded')
+        if (clip.size > 0) {
+          setHasClip(true)
+          setState('recorded')
+        } else {
+          setHasClip(false)
+          setError('Recording failed to capture video data. Please try again.')
+          setState('ready')
+        }
       }
-      recorder.start()
+      recorder.start(500)
       setSeconds(12)
       setState('recording')
       timerRef.current = window.setInterval(() => setSeconds((remaining) => {
         if (remaining <= 1) {
           window.clearInterval(timerRef.current)
-          recorder.stop()
+          if (recorder.state === 'recording') {
+            recorder.stop()
+          }
           return 0
         }
         return remaining - 1
       }), 1000)
-    } catch {
+    } catch (recErr) {
+      console.error('Failed to start MediaRecorder:', recErr)
       setError('This browser could not start a recording. Check camera permissions and try again.')
+      setState('ready')
     }
   }
 
   function stopCamera() {
+    window.clearInterval(timerRef.current)
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
     setStreamOn(false)
     setState('idle')
     setHasClip(false)
     recordingClip.current = null
   }
 
-  function handleTryAgain() {
+  async function handleTryAgain() {
     setError('')
     setVerificationResult(null)
     setHasClip(false)
     recordingClip.current = null
-    setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
-    if (streamRef.current) {
-      setState('idle')
+    const stream = streamRef.current
+    const vTrack = stream?.getVideoTracks()[0]
+    const aTrack = stream?.getAudioTracks()[0]
+
+    // Fetch new phrase
+    try {
+      const phraseRes = await api('/check-ins/phrase', { timeoutMs: 5000 })
+      if (phraseRes?.sentence) {
+        setSentence(phraseRes.sentence)
+      } else {
+        setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
+      }
+    } catch {
+      setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
+    }
+
+    if (stream && vTrack?.readyState === 'live' && aTrack?.readyState === 'live') {
+      setState('ready')
     } else {
-      openCamera()
+      requestPermissions()
     }
   }
 
@@ -2918,7 +3037,7 @@ function Checkin({ token, onComplete, onNavigate }) {
 
     try {
       const clip = recordingClip.current
-      if (!clip?.size) {
+      if (!clip || !clip.size) {
         throw new Error('No check-in recording is available. Please record again.')
       }
       const form = new FormData()
@@ -2967,6 +3086,7 @@ function Checkin({ token, onComplete, onNavigate }) {
       const jobId = jobResponse.job_id
 
       if (jobId) {
+        setState('processing')
         // Poll for job completion: max 60 attempts * 2000ms = 120 seconds
         const pollStartTime = Date.now()
         const maxWaitMs = 120000
@@ -2982,8 +3102,17 @@ function Checkin({ token, onComplete, onNavigate }) {
               break
             }
           } catch (pollErr) {
-            if (pollErr.status === 401 || pollErr.status === 404) {
+            if (pollErr.status === 401) {
               throw pollErr
+            }
+            if (pollErr.status === 404) {
+              setState('unavailable')
+              setVerificationResult({
+                status: 'unavailable',
+                message: 'Check-in job expired or was not found on the server. No check-in was saved. Please try again.',
+                checks: { face: 'unavailable', liveness: 'unavailable', voice: 'unavailable' },
+              })
+              return
             }
             console.warn('Transient check-in poll error, retrying...', pollErr.message)
           }
@@ -3028,6 +3157,7 @@ function Checkin({ token, onComplete, onNavigate }) {
           checkin: response.checkin,
         })
         recordingClip.current = null
+        stopCamera()
         if (onComplete && response.checkin) {
           await onComplete(response.checkin)
         }
@@ -3052,7 +3182,10 @@ function Checkin({ token, onComplete, onNavigate }) {
         errData.status === 'verification_unavailable' ||
         errData.verification_unavailable ||
         requestError.message?.includes('unreachable') ||
-        requestError.message?.includes('Failed to fetch')
+        requestError.message?.includes('Failed to fetch') ||
+        requestError.message?.includes('taking too long') ||
+        requestError.name === 'TimeoutError' ||
+        status === 408
 
       if (isUnavailable) {
         setState('unavailable')
@@ -3064,10 +3197,8 @@ function Checkin({ token, onComplete, onNavigate }) {
       } else {
         setState('failed')
         let failMsg = 'Verification failed. Please try again.'
-        if (requestError.message?.includes('taking too long') || requestError.name === 'TimeoutError' || status === 408) {
-          failMsg = 'Verification took too long. Please try again.'
-        } else if (status === 500) {
-          failMsg = 'Live verification service encountered an error. Please try again.'
+        if (status === 500) {
+          failMsg = 'Live verification service encountered an internal error. Please try again.'
         } else if (status === 422) {
           failMsg = errData.detail || 'Unable to process the recording. Please record again.'
         } else if (status === 401) {
@@ -3083,8 +3214,7 @@ function Checkin({ token, onComplete, onNavigate }) {
         })
       }
     } finally {
-      // Guaranteed cleanup: resets 'submitting' state if an unexpected throw bypassed normal assignment
-      setState((curr) => (curr === 'submitting' ? 'failed' : curr))
+      setState((curr) => (curr === 'submitting' || curr === 'processing' ? 'failed' : curr))
     }
   }
 
@@ -3106,21 +3236,21 @@ function Checkin({ token, onComplete, onNavigate }) {
           <span className="checkin-duration"><Icon name="clock" size={14} /> ABOUT 12 SEC</span>
         </div>
         <div className="checkin-steps">
-          <div className={`checkin-step ${streamOn ? 'step-done' : 'step-current'}`}>
-            <span>01</span><div><b>Allow camera & microphone</b><small>They’re used only for this check-in.</small></div>{streamOn && <span className="step-check">✓</span>}
+          <div className={`checkin-step ${state !== 'idle' && state !== 'permission_request' ? 'step-done' : 'step-current'}`}>
+            <span>01</span><div><b>Allow camera & microphone</b><small>They’re used only for this check-in.</small></div>{(state !== 'idle' && state !== 'permission_request') && <span className="step-check">✓</span>}
           </div>
-          <div className={`checkin-step ${streamOn && state !== 'success' && state !== 'failed' && state !== 'unavailable' ? 'step-current' : ''}`}>
-            <span>02</span><div><b>Read your personal phrase</b><small>A new phrase is chosen each time.</small></div>
+          <div className={`checkin-step ${(state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') ? 'step-done' : state === 'ready' ? 'step-current' : ''}`}>
+            <span>02</span><div><b>Read your personal phrase</b><small>A new phrase is chosen each time.</small></div>{(state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') && <span className="step-check">✓</span>}
           </div>
-          <div className={`checkin-step ${state === 'recording' || state === 'recorded' || state === 'submitting' ? 'step-current' : ''}`}>
-            <span>03</span><div><b>Record a short live clip</b><small>Keep your face in frame as you speak.</small></div>
+          <div className={`checkin-step ${(state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') ? 'step-done' : state === 'recording' ? 'step-current' : ''}`}>
+            <span>03</span><div><b>Record a short live clip</b><small>Keep your face in frame as you speak.</small></div>{(state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') && <span className="step-check">✓</span>}
           </div>
-          <div className={`checkin-step ${state === 'success' || state === 'failed' || state === 'unavailable' ? 'step-current' : ''}`}>
-            <span>04</span><div><b>Review your result</b><small>See whether verification passed.</small></div>
+          <div className={`checkin-step ${state === 'success' || state === 'failed' || state === 'unavailable' ? 'step-current' : state === 'submitting' || state === 'processing' ? 'step-active' : ''}`}>
+            <span>04</span><div><b>Review your result</b><small>See whether verification passed.</small></div>{state === 'success' && <span className="step-check">✓</span>}
           </div>
         </div>
 
-        {streamOn && (state === 'idle' || state === 'recording' || state === 'recorded' || state === 'submitting') && (
+        {(state === 'ready' || state === 'recording' || state === 'recorded') && (
           <div className="checkin-phrase">
             <span className="eyebrow">READ THIS PHRASE ALOUD</span>
             <p>"{sentence}"</p>
@@ -3130,7 +3260,7 @@ function Checkin({ token, onComplete, onNavigate }) {
 
         {error && <div className="notice notice-error">{error}</div>}
 
-        {!streamOn && state === 'idle' && (
+        {(state === 'idle' || state === 'permission_request') && (
           <>
             <div className="checkin-tips">
               <Icon name="shield" size={15} />
@@ -3148,17 +3278,29 @@ function Checkin({ token, onComplete, onNavigate }) {
               <Icon name="lock" size={15} />
               <span>Your recording is securely analyzed by this server and immediately deleted after processing.</span>
             </div>
-            <button className="button button-primary" onClick={openCamera}>
-              Begin check-in <Icon name="arrow" size={17} />
+            <button
+              className="button button-primary"
+              onClick={requestPermissions}
+              disabled={state === 'permission_request'}
+            >
+              {state === 'permission_request' ? 'Requesting permissions...' : 'Allow camera & microphone'} <Icon name="arrow" size={17} />
             </button>
           </>
         )}
 
-        {streamOn && state === 'idle' && (
+        {state === 'ready' && (
           <div className="phrase-panel">
-            <div className="button-row">
+            <div className="checkin-badges">
+              <span className="checkin-badge checkin-badge-ready">✓ Camera ready</span>
+              <span className="checkin-badge checkin-badge-ready">✓ Microphone ready</span>
+            </div>
+            <div className="checkin-guidance">
+              <div>• Keep your face inside the frame.</div>
+              <div>• Look at the camera and speak clearly.</div>
+            </div>
+            <div className="button-row" style={{ marginTop: '12px' }}>
               <button className="button button-primary" onClick={startRecording}>
-                <span className="record-dot" /> Start 12-second recording
+                <span className="record-dot" /> Start check-in
               </button>
               <button className="button button-quiet" onClick={stopCamera}>Cancel</button>
             </div>
@@ -3167,39 +3309,59 @@ function Checkin({ token, onComplete, onNavigate }) {
 
         {state === 'recording' && (
           <div className="recording-panel">
+            <div className="checkin-badges" style={{ justifyContent: 'center' }}>
+              <span className="checkin-badge checkin-badge-ready">Camera ✓</span>
+              <span className="checkin-badge checkin-badge-ready">Microphone ✓</span>
+              <span className="checkin-badge checkin-badge-recording">Recording ●</span>
+            </div>
             <span className="recording-pulse" />
             <b>Recording — read the phrase above aloud</b>
             <span className="timer-count">{seconds}<small>sec</small></span>
             <div className="recording-progress-bar"><span style={{ width: `${((12 - seconds) / 12) * 100}%` }} /></div>
             <small>Speak naturally and keep your face centred in the camera.</small>
             <div className="button-row" style={{ marginTop: '12px' }}>
-              <button className="button button-secondary" disabled>Recording...</button>
+              <button className="button button-secondary" disabled>Recording in progress...</button>
             </div>
           </div>
         )}
 
-        {(state === 'recorded' || state === 'submitting') && (
+        {state === 'recorded' && (
           <div className="phrase-panel">
             <span className="eyebrow">RECORDING COMPLETE</span>
             <div className="checkin-privacy">
               <Icon name="shield" size={15} />
-              <span>{hasClip ? 'Click Verify check-in to run face match, anti-spoof liveness, and voice verification.' : 'No recording data was captured. Please record again.'}</span>
+              <span>{hasClip ? 'Your clip is ready for verification. Submit the clip to run face matching, anti-spoof liveness, and voice verification.' : 'No recording data was captured. Please record again.'}</span>
             </div>
             <div className="button-row">
               <button
                 className="button button-primary"
                 onClick={saveCheckin}
-                disabled={state === 'submitting' || !hasClip}
+                disabled={!hasClip}
               >
-                {state === 'submitting' ? 'Analyzing face, liveness & voice…' : 'Verify check-in'} <Icon name="arrow" size={17} />
+                Verify check-in <Icon name="arrow" size={17} />
               </button>
               <button
                 className="button button-quiet"
                 onClick={handleTryAgain}
-                disabled={state === 'submitting'}
               >
                 Try again
               </button>
+            </div>
+          </div>
+        )}
+
+        {(state === 'submitting' || state === 'processing') && (
+          <div className="recording-panel">
+            <span className="recording-pulse" style={{ background: '#6366f1', boxShadow: '0 0 0 6px #e0e7ff' }} />
+            <b style={{ fontSize: '15px' }}>Analyzing face, liveness & voice...</b>
+            <small>Verification in progress. The server is analyzing face matching, anti-spoof liveness, and voice phrase.</small>
+            <div className="result-checks" style={{ marginTop: '14px', width: '100%', maxWidth: '370px' }}>
+              <div><span>Face matching</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>
+              <div><span>Anti-spoof liveness</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>
+              <div><span>Voice verification</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>
+            </div>
+            <div className="button-row" style={{ marginTop: '12px' }}>
+              <button className="button button-secondary" disabled>Analyzing face, liveness & voice...</button>
             </div>
           </div>
         )}
@@ -3228,7 +3390,6 @@ function Checkin({ token, onComplete, onNavigate }) {
               <button className="button button-primary" onClick={() => { stopCamera(); if (onNavigate) onNavigate('dashboard') }}>
                 Return to dashboard <Icon name="arrow" size={17} />
               </button>
-              <button className="button button-secondary" disabled>Check-in verified</button>
             </div>
           </div>
         )}
@@ -3293,7 +3454,7 @@ function Checkin({ token, onComplete, onNavigate }) {
           </div>
         )}
 
-        <video className={`checkin-video ${streamOn ? 'video-visible' : ''}`} ref={videoRef} muted playsInline />
+        <video className={`checkin-video ${state === 'ready' || state === 'recording' || state === 'recorded' ? 'video-visible' : ''}`} ref={videoRef} autoPlay playsInline muted />
       </section>
       <aside className="checkin-aside">
         <section className="surface aside-card">

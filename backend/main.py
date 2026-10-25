@@ -552,6 +552,17 @@ def init_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_notifications_dup_check 
                 ON public.notifications(owner_id, notification_type, state_transition, recipient_email);
+
+            CREATE TABLE IF NOT EXISTS checkin_jobs (
+                id TEXT PRIMARY KEY,
+                owner_id BIGINT NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                result_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_checkin_jobs_owner_id ON public.checkin_jobs(owner_id);
             """
         )
         migrate_schema(connection)
@@ -3710,11 +3721,17 @@ _JOB_EXPIRY_SECONDS = 900  # 15 minutes
 
 
 def _cleanup_old_checkin_jobs():
-    cutoff = time.time() - _JOB_EXPIRY_SECONDS
+    cutoff = time.time() - 3600  # 1 hour
     with _CHECKIN_JOBS_LOCK:
         expired = [jid for jid, info in _CHECKIN_JOBS.items() if info.get("created_at", 0) < cutoff]
         for jid in expired:
             _CHECKIN_JOBS.pop(jid, None)
+    try:
+        cutoff_iso = (utc_now() - timedelta(seconds=3600)).isoformat()
+        with db() as connection:
+            connection.execute("DELETE FROM checkin_jobs WHERE created_at < ?", (cutoff_iso,))
+    except Exception as exc:
+        logger.debug("Old checkin jobs DB cleanup note: %s", exc)
 
 
 def _process_verification_and_db(
@@ -3735,6 +3752,7 @@ def _process_verification_and_db(
     checkin_status = "success" if passed else "failed"
     event = "checkin.verified_passed" if passed else "checkin.verified_failed"
     face_detail = statuses.get("face_detail") or ("matched" if statuses.get("face_status") == "passed" else "different_person")
+    speech_detail = statuses.get("speech_detail") or ("matched" if statuses.get("speech_status") == "passed" else "mismatch")
     
     if not passed and statuses.get("face_status") != "passed":
         if face_detail == "different_person":
@@ -3750,9 +3768,14 @@ def _process_verification_and_db(
         else:
             message = "Face verification did not pass."
     elif not passed and statuses.get("liveness_status") != "passed":
-        message = "Liveness verification failed: motion or liveliness could not be verified."
+        message = "Liveness verification failed: live movement could not be verified. Please keep your face visible and try again."
     elif not passed and statuses.get("speech_status") != "passed":
-        message = "Voice verification failed: spoken phrase did not match the expected phrase."
+        if speech_detail == "no_audio":
+            message = "Your recording did not contain microphone audio. Please allow microphone access and try again."
+        elif speech_detail == "silent":
+            message = "Voice verification failed: no speech was detected in the recording. Please speak the phrase aloud clearly."
+        else:
+            message = "Voice verification failed: spoken phrase did not match the expected phrase."
     elif passed:
         message = "Live check-in completed successfully."
     else:
@@ -3894,45 +3917,65 @@ def _run_async_checkin_job(job_id: str, user: dict, sentence: str, suffix: str, 
                 "SELECT face_enrollment FROM users WHERE id=?", (user["id"],)
             ).fetchone()
         if owner is None or owner["face_enrollment"] is None:
+            err_msg = "Face enrollment is missing. Re-enroll your face before checking in."
+            fail_result = {
+                "success": False,
+                "passed": False,
+                "status": "failed",
+                "checkin_saved": False,
+                "message": err_msg,
+                "checks": {"face": "failed", "liveness": "failed", "voice": "failed"},
+            }
             with _CHECKIN_JOBS_LOCK:
                 _CHECKIN_JOBS[job_id] = {
                     "job_id": job_id,
                     "user_id": user["id"],
                     "status": "failed",
-                    "error": "Face enrollment is missing. Re-enroll your face before checking in.",
-                    "result": {
-                        "success": False,
-                        "passed": False,
-                        "status": "failed",
-                        "checkin_saved": False,
-                        "message": "Face enrollment is missing. Re-enroll your face before checking in.",
-                        "checks": {"face": "failed", "liveness": "failed", "voice": "failed"},
-                    },
+                    "error": err_msg,
+                    "result": fail_result,
                     "created_at": time.time(),
                     "updated_at": time.time(),
                 }
+            try:
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE checkin_jobs SET status='failed', result_json=?, error_message=?, updated_at=? WHERE id=?",
+                        (json.dumps(fail_result), err_msg, utc_now().isoformat(), job_id),
+                    )
+            except Exception as e:
+                logger.debug("checkin_jobs db update note: %s", e)
             return
 
         try:
             enrollment_samples = json.loads(decrypt_bytes(owner["face_enrollment"]))
         except Exception as error:
+            err_msg = "Face enrollment data could not be read."
+            fail_result = {
+                "success": False,
+                "passed": False,
+                "status": "failed",
+                "checkin_saved": False,
+                "message": "Face enrollment data could not be read. Please contact support.",
+                "checks": {"face": "failed", "liveness": "failed", "voice": "failed"},
+            }
             with _CHECKIN_JOBS_LOCK:
                 _CHECKIN_JOBS[job_id] = {
                     "job_id": job_id,
                     "user_id": user["id"],
                     "status": "failed",
-                    "error": "Face enrollment data could not be read.",
-                    "result": {
-                        "success": False,
-                        "passed": False,
-                        "status": "failed",
-                        "checkin_saved": False,
-                        "message": "Face enrollment data could not be read. Please contact support.",
-                        "checks": {"face": "failed", "liveness": "failed", "voice": "failed"},
-                    },
+                    "error": err_msg,
+                    "result": fail_result,
                     "created_at": time.time(),
                     "updated_at": time.time(),
                 }
+            try:
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE checkin_jobs SET status='failed', result_json=?, error_message=?, updated_at=? WHERE id=?",
+                        (json.dumps(fail_result), err_msg, utc_now().isoformat(), job_id),
+                    )
+            except Exception as e:
+                logger.debug("checkin_jobs db update note: %s", e)
             return
 
         with tempfile.TemporaryDirectory(prefix="cloudguard-checkin-") as directory:
@@ -3953,54 +3996,89 @@ def _run_async_checkin_job(job_id: str, user: dict, sentence: str, suffix: str, 
                 "created_at": _CHECKIN_JOBS.get(job_id, {}).get("created_at", time.time()),
                 "updated_at": time.time(),
             }
+        try:
+            with db() as conn:
+                conn.execute(
+                    "UPDATE checkin_jobs SET status='completed', result_json=?, updated_at=? WHERE id=?",
+                    (json.dumps(result), utc_now().isoformat(), job_id),
+                )
+        except Exception as e:
+            logger.debug("checkin_jobs db update note: %s", e)
+
         logger.info("[CHECKIN JOB %s] Finished successfully, passed=%s", job_id, result.get("passed"))
 
     except VerificationUnavailable as error:
         logger.warning("[CHECKIN JOB %s] Verification unavailable: %s", job_id, error)
+        unavail_res = {
+            "success": False,
+            "checkin_saved": False,
+            "verification_unavailable": True,
+            "status": "verification_unavailable",
+            "message": str(error) or "Live verification services are temporarily unavailable.",
+            "checks": {
+                "face": "unavailable",
+                "liveness": "unavailable",
+                "voice": "unavailable",
+            },
+        }
         with _CHECKIN_JOBS_LOCK:
             _CHECKIN_JOBS[job_id] = {
                 "job_id": job_id,
                 "user_id": user["id"],
                 "status": "unavailable",
-                "result": {
-                    "success": False,
-                    "checkin_saved": False,
-                    "verification_unavailable": True,
-                    "status": "verification_unavailable",
-                    "message": str(error) or "Live verification services are temporarily unavailable.",
-                    "checks": {
-                        "face": "unavailable",
-                        "liveness": "unavailable",
-                        "voice": "unavailable",
-                    },
-                },
+                "result": unavail_res,
                 "created_at": _CHECKIN_JOBS.get(job_id, {}).get("created_at", time.time()),
                 "updated_at": time.time(),
             }
+        try:
+            with db() as conn:
+                conn.execute(
+                    "UPDATE checkin_jobs SET status='unavailable', result_json=?, error_message=?, updated_at=? WHERE id=?",
+                    (json.dumps(unavail_res), str(error), utc_now().isoformat(), job_id),
+                )
+        except Exception as e:
+            logger.debug("checkin_jobs db update note: %s", e)
+
     except Exception as error:
         logger.exception("[CHECKIN JOB %s] Unexpected verification failure: %s", job_id, error)
+        err_res = {
+            "success": False,
+            "checkin_saved": False,
+            "verification_unavailable": True,
+            "status": "verification_unavailable",
+            "message": "Verification service is temporarily unavailable. No check-in was recorded. Please try again.",
+            "checks": {
+                "face": "unavailable",
+                "liveness": "unavailable",
+                "voice": "unavailable",
+            },
+        }
         with _CHECKIN_JOBS_LOCK:
             _CHECKIN_JOBS[job_id] = {
                 "job_id": job_id,
                 "user_id": user["id"],
                 "status": "unavailable",
-                "result": {
-                    "success": False,
-                    "checkin_saved": False,
-                    "verification_unavailable": True,
-                    "status": "verification_unavailable",
-                    "message": "Verification service is temporarily unavailable. No check-in was recorded. Please try again.",
-                    "checks": {
-                        "face": "unavailable",
-                        "liveness": "unavailable",
-                        "voice": "unavailable",
-                    },
-                },
+                "result": err_res,
                 "created_at": _CHECKIN_JOBS.get(job_id, {}).get("created_at", time.time()),
                 "updated_at": time.time(),
             }
+        try:
+            with db() as conn:
+                conn.execute(
+                    "UPDATE checkin_jobs SET status='unavailable', result_json=?, error_message=?, updated_at=? WHERE id=?",
+                    (json.dumps(err_res), str(error), utc_now().isoformat(), job_id),
+                )
+        except Exception as e:
+            logger.debug("checkin_jobs db update note: %s", e)
     finally:
         _cleanup_old_checkin_jobs()
+
+
+@app.get("/api/check-ins/phrase")
+@app.get("/api/checkin/phrase")
+def get_checkin_phrase():
+    import random
+    return {"sentence": random.choice(list(CHECKIN_SENTENCES))}
 
 
 @app.post("/api/check-ins/start", status_code=202)
@@ -4055,6 +4133,7 @@ def start_checkin_job(
         raise HTTPException(status_code=409, detail="Face enrollment is missing. Re-enroll your face before checking in.")
 
     job_id = str(uuid.uuid4())
+    now_iso = utc_now().isoformat()
     with _CHECKIN_JOBS_LOCK:
         _CHECKIN_JOBS[job_id] = {
             "job_id": job_id,
@@ -4065,6 +4144,17 @@ def start_checkin_job(
             "created_at": time.time(),
             "updated_at": time.time(),
         }
+
+    try:
+        with db() as connection:
+            connection.execute(
+                """INSERT INTO checkin_jobs(id, owner_id, status, result_json, error_message, created_at, updated_at)
+                   VALUES(?, ?, 'processing', NULL, NULL, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET status='processing', updated_at=excluded.updated_at""",
+                (job_id, user["id"], now_iso, now_iso),
+            )
+    except Exception as db_err:
+        logger.warning("Could not persist initial checkin_job to PostgreSQL: %s", db_err)
 
     thread = threading.Thread(
         target=_run_async_checkin_job,
@@ -4083,12 +4173,45 @@ def start_checkin_job(
 @app.get("/api/check-ins/status/{job_id}")
 @app.get("/api/checkin/status/{job_id}")
 def get_checkin_job_status(job_id: str, user: dict = Depends(current_user)):
+    job = None
+    job_status = None
+    result = None
+    error_msg = None
+
     with _CHECKIN_JOBS_LOCK:
-        job = _CHECKIN_JOBS.get(job_id)
-        if not job or job.get("user_id") != user["id"]:
-            raise HTTPException(status_code=404, detail="Check-in job not found or expired.")
-        job_status = job.get("status", "processing")
-        result = job.get("result")
+        mem_job = _CHECKIN_JOBS.get(job_id)
+        if mem_job and mem_job.get("user_id") == user["id"]:
+            job = mem_job
+            job_status = mem_job.get("status", "processing")
+            result = mem_job.get("result")
+            error_msg = mem_job.get("error")
+
+    # If not found in memory, or if status is still processing, check persistent database
+    if not job or job_status == "processing":
+        try:
+            with db() as connection:
+                db_row = connection.execute(
+                    "SELECT status, result_json, error_message FROM checkin_jobs WHERE id=? AND owner_id=?",
+                    (job_id, user["id"]),
+                ).fetchone()
+            if db_row:
+                job_status = db_row["status"]
+                result = json.loads(db_row["result_json"]) if db_row["result_json"] else None
+                error_msg = db_row["error_message"]
+                with _CHECKIN_JOBS_LOCK:
+                    _CHECKIN_JOBS[job_id] = {
+                        "job_id": job_id,
+                        "user_id": user["id"],
+                        "status": job_status,
+                        "result": result,
+                        "error": error_msg,
+                        "updated_at": time.time(),
+                    }
+        except Exception as query_err:
+            logger.warning("Check-in job DB status lookup warning: %s", query_err)
+
+    if not job_status:
+        raise HTTPException(status_code=404, detail="Check-in job not found or expired.")
 
     if job_status == "processing":
         return {
@@ -4115,8 +4238,8 @@ def get_checkin_job_status(job_id: str, user: dict = Depends(current_user)):
             "passed": False,
             "status": "failed",
             "checkin_saved": False,
-            "message": job.get("error", "Verification failed. Please try again."),
-            "failure_reason": job.get("error", "Verification failed. Please try again."),
+            "message": error_msg or "Verification failed. Please try again.",
+            "failure_reason": error_msg or "Verification failed. Please try again.",
             "checks": {"face": "failed", "liveness": "failed", "voice": "failed"},
         })
     return {"job_id": job_id, "status": job_status}

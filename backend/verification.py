@@ -34,9 +34,9 @@ _TRANSCRIBE_LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
 FACE_MODEL = "Facenet"
-# Robust face matching distance threshold (DeepFace Facenet cosine default is 0.40)
-# 0.36 admits authentic owners across natural lighting/angles while blocking other individuals.
-FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.36"))
+# Robust face matching distance threshold (DeepFace Facenet cosine distance)
+# 0.28 admits authentic enrolled owners across natural variations while blocking different angles/persons.
+FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.28"))
 MIN_FACE_PX = 24
 MAX_FACE_FRAME_COVERAGE = 0.85
 # Sample 16 frames spanning the full 12s recording (every ~0.75s)
@@ -280,6 +280,17 @@ def _shrink_frame(frame, cv2, max_side: int = _MAX_FRAME_SIDE):
     return cv2.resize(frame, (max(1, int(width * scale)), max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
 
 
+def _has_audio_stream(video_path: Path) -> bool:
+    """Check if the video recording container contains at least one audio stream."""
+    try:
+        import av
+        with av.open(str(video_path)) as container:
+            return len(container.streams.audio) > 0
+    except Exception as exc:
+        logger.debug("Audio stream check via PyAV failed (%s), assuming audio present.", exc)
+        return True
+
+
 def _transcribe_recording(video_path: Path) -> str:
     transcript = ""
     try:
@@ -504,23 +515,59 @@ def _cosine_distance(embedding_a, embedding_b) -> float:
 
 
 def _identity_matches_enrollment(live_embedding, enrollment_embeddings: list) -> bool:
-    """Return True if the live face matches the enrollment samples."""
+    """Return True if the live face matches a majority of the enrollment samples."""
     if live_embedding is None or not enrollment_embeddings:
+        return False
+    if len(enrollment_embeddings) < 5:
         return False
     distances = [_cosine_distance(live_embedding, ref) for ref in enrollment_embeddings]
     if not distances:
         return False
-    min_dist = float(min(distances))
-    median_dist = float(np.median(np.asarray(distances, dtype=np.float64)))
     matches = sum(1 for d in distances if d <= FACE_MATCH_MAX_DISTANCE)
-    # Require at least 2 matching reference samples, OR strong match on at least one sample (dist <= 0.30)
-    needed_matches = max(2, (len(enrollment_embeddings) + 1) // 3)
-    is_match = (matches >= needed_matches and median_dist <= (FACE_MATCH_MAX_DISTANCE + 0.05)) or (min_dist <= 0.30)
+    needed_matches = (len(enrollment_embeddings) // 2) + 1
+    is_match = matches >= needed_matches
     logger.debug(
-        "[FACE MATCH] distances=%s, matches=%d/%d, min=%.3f, median=%.3f, is_match=%s",
-        [round(d, 3) for d in distances], matches, len(enrollment_embeddings), min_dist, median_dist, is_match
+        "[FACE MATCH] distances=%s, matches=%d/%d, needed=%d, is_match=%s",
+        [round(d, 3) for d in distances], matches, len(enrollment_embeddings), needed_matches, is_match
     )
     return is_match
+
+
+def _decide_face_outcome(matched_faces: int, total_faces: int) -> tuple[str, str]:
+    if total_faces < 2:
+        return ("failed", "no_face")
+    if matched_faces >= 2 and (matched_faces / total_faces) >= 0.5:
+        return ("passed", "matched")
+    return ("failed", "different_person")
+
+
+def _region_is_usable(w: int, h: int, frame_shape: tuple, confidence: float | None = None) -> bool:
+    frame_h, frame_w = frame_shape[:2]
+    if w < 50 or h < 50:
+        return False
+    if w >= frame_w * 0.95 or h >= frame_h * 0.95:
+        return False
+    return True
+
+
+def _compare_face_to_enrollment(DeepFace, cv2, face_frame, enrollment_frames: list) -> bool:
+    try:
+        live_res = DeepFace.represent(img_path=face_frame, model_name="Facenet512", enforce_detection=False)
+        live_emb = live_res[0]["embedding"]
+    except Exception as e:
+        raise VerificationUnavailable(f"Face model error: {e}") from e
+
+    matches = 0
+    for enf in enrollment_frames:
+        try:
+            en_res = DeepFace.represent(img_path=enf, model_name="Facenet512", enforce_detection=False)
+            en_emb = en_res[0]["embedding"]
+            dist = _cosine_distance(live_emb, en_emb)
+            if dist <= 0.40:
+                matches += 1
+        except Exception as e:
+            raise VerificationUnavailable(f"Face model error: {e}") from e
+    return matches >= max(1, len(enrollment_frames) // 2)
 
 
 def _enrollment_embeddings(DeepFace, cv2, enrollment_images: list) -> list:
@@ -949,16 +996,33 @@ def verify_recording(
         # 2. Transcribe speech in isolated worker process (memory freed upon exit)
         t_speech_start = time.perf_counter()
         logger.info("[CHECKIN] Speech verification started")
-        transcript = _run_speech_subprocess(video_path)
-        speech_status = "passed" if _phrase_matches(sentence, transcript) else "failed"
-        logger.info("[CHECKIN] Speech verification completed")
-        t_speech = time.perf_counter() - t_speech_start
+        has_audio = _has_audio_stream(video_path)
+        logger.info("[CHECKIN] Audio stream present: %s", has_audio)
+        if not has_audio:
+            speech_status = "failed"
+            speech_detail = "no_audio"
+            t_speech = 0.0
+            logger.info("[CHECKIN] Speech verification completed: no audio stream detected in container")
+        else:
+            transcript = _run_speech_subprocess(video_path)
+            t_speech = time.perf_counter() - t_speech_start
+            logger.info("[CHECKIN] Speech verification completed, transcript: %r", transcript)
+            if not transcript or not transcript.strip():
+                speech_status = "failed"
+                speech_detail = "silent"
+            elif _phrase_matches(sentence, transcript):
+                speech_status = "passed"
+                speech_detail = "matched"
+            else:
+                speech_status = "failed"
+                speech_detail = "mismatch"
 
         result = {
             "face_status": face_res.get("face_status", "failed"),
             "face_detail": face_res.get("face_detail", "no_face"),
             "liveness_status": face_res.get("liveness_status", "failed"),
             "speech_status": speech_status,
+            "speech_detail": speech_detail,
             "timings": {
                 "face": t_face,
                 "liveness": t_liveness,

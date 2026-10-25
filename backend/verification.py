@@ -1,9 +1,11 @@
 import base64
 import difflib
+import json
 import logging
 import math
 import os
 import re
+import subprocess
 import sys
 import threading
 import tempfile
@@ -476,24 +478,159 @@ def _enrollment_embeddings(DeepFace, cv2, enrollment_images: list) -> list:
         embedding = _embedding_from_frame(DeepFace, cv2, reference)
         if embedding is not None:
             embeddings.append(embedding)
-    if len(embeddings) < 2:
-        raise VerificationUnavailable(
-            "Face matching could not read the enrollment samples. Re-enroll your face and try again."
-        )
     return embeddings
 
 
-def _compare_face_to_enrollment(DeepFace, cv2, live_frame, enrollment_images: list) -> bool:
-    """
-    Return True if the live face matches a majority of enrollment images.
-    Faces must be detected; whole-frame / background comparisons are not used.
-    """
-    live_embedding = _embedding_from_frame(DeepFace, cv2, live_frame)
-    if live_embedding is None:
-        return False
-    return _identity_matches_enrollment(
-        live_embedding, _enrollment_embeddings(DeepFace, cv2, enrollment_images)
+def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) -> dict:
+    """Evaluate face match and liveness in an isolated worker process."""
+    try:
+        import cv2
+        from deepface import DeepFace
+    except Exception as error:
+        logger.exception("Importing cv2 or DeepFace failed")
+        raise VerificationUnavailable(
+            f"Local verification models are unavailable: {error}"
+        ) from error
+
+    frames = [_shrink_frame(frame, cv2) for frame in _video_frames(video_path, cv2)]
+    enrollment_images = [_shrink_frame(image, cv2) for image in _enrollment_images(encoded_samples, cv2)]
+    enrollment_vectors = _enrollment_embeddings(DeepFace, cv2, enrollment_images)
+
+    liveness_votes = 0
+    live_frames: list = []
+
+    # Anti-spoofing on two frames
+    for index, frame in enumerate(frames):
+        anti_spoofing = index < 2
+        detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=anti_spoofing)
+        if not detected and anti_spoofing:
+            detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=False)
+        if not (detected and len(detected) == 1):
+            continue
+        best = detected[0]
+        if anti_spoofing and bool(best.get("is_real", False)):
+            liveness_votes += 1
+            live_frames.append(frame)
+        elif (not anti_spoofing) or best.get("confidence", 0) > 0.4:
+            live_frames.append(frame)
+
+    if not live_frames:
+        for frame in frames:
+            detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=False)
+            if detected and len(detected) == 1:
+                live_frames.append(frame)
+
+    identity_votes = 0
+    frames_attempted = 0
+    for frame in live_frames:
+        try:
+            live_embedding = _embedding_from_frame(DeepFace, cv2, frame)
+        except Exception as exc:
+            logger.debug("Live face embedding failed for a frame: %s", exc)
+            continue
+        if live_embedding is None:
+            continue
+        frames_attempted += 1
+        if _identity_matches_enrollment(live_embedding, enrollment_vectors):
+            identity_votes += 1
+
+    face_status, face_detail = _decide_face_outcome(identity_votes, frames_attempted)
+    liveness_status = "passed" if liveness_votes >= 1 else "failed"
+
+    return {
+        "face_status": face_status,
+        "face_detail": face_detail,
+        "liveness_status": liveness_status,
+    }
+
+
+def _run_speech_subprocess(video_path: Path) -> str:
+    """Run speech transcription in an isolated process to reclaim all memory upon completion."""
+    script = (
+        "import sys, os\n"
+        "os.environ['PYTHONIOENCODING'] = 'utf-8'\n"
+        "os.environ['PYTHONUTF8'] = '1'\n"
+        "from pathlib import Path\n"
+        "from backend.verification import _transcribe_recording\n"
+        f"t = _transcribe_recording(Path(r'{str(video_path).replace(chr(92), '/')}'))\n"
+        "print('__TRANSCRIPT__:' + t)\n"
     )
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    backend_root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = backend_root
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=45,
+        )
+        for line in proc.stdout.splitlines():
+            if line.startswith("__TRANSCRIPT__:"):
+                return line.split("__TRANSCRIPT__:", 1)[1].strip()
+        logger.warning("Speech worker output: %s (err: %s)", proc.stdout, proc.stderr)
+    except Exception as exc:
+        logger.warning("Speech worker failed: %s; falling back to in-process", exc)
+        return _transcribe_recording(video_path)
+    return ""
+
+
+def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
+    """Run face evaluation in an isolated process to reclaim all memory upon completion."""
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump(encoded_samples, f)
+        samples_file = f.name
+
+    script = (
+        "import sys, os, json\n"
+        "os.environ['PYTHONIOENCODING'] = 'utf-8'\n"
+        "os.environ['PYTHONUTF8'] = '1'\n"
+        "os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'\n"
+        "os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'\n"
+        "if hasattr(sys.stdout, 'reconfigure'):\n"
+        "    sys.stdout.reconfigure(encoding='utf-8')\n"
+        "from pathlib import Path\n"
+        "from backend.verification import _evaluate_face_and_liveness\n"
+        f"with open(r'{samples_file.replace(chr(92), '/')}', 'r', encoding='utf-8') as f:\n"
+        "    samples = json.load(f)\n"
+        f"res = _evaluate_face_and_liveness(Path(r'{str(video_path).replace(chr(92), '/')}'), samples)\n"
+        "print('__FACE_RESULT__:' + json.dumps(res))\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    env["TF_ENABLE_ONEDNN_OPTS"] = "0"
+    backend_root = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONPATH"] = backend_root
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            timeout=55,
+        )
+        for line in proc.stdout.splitlines():
+            if line.startswith("__FACE_RESULT__:"):
+                return json.loads(line.split("__FACE_RESULT__:", 1)[1].strip())
+        logger.warning("Face worker output: %s (err: %s)", proc.stdout, proc.stderr)
+    except Exception as exc:
+        logger.warning("Face worker failed: %s; falling back to in-process", exc)
+        return _evaluate_face_and_liveness(video_path, encoded_samples)
+    finally:
+        try:
+            os.remove(samples_file)
+        except OSError:
+            pass
+    return {"face_status": "failed", "face_detail": "no_face", "liveness_status": "failed"}
 
 
 def verify_recording(
@@ -506,100 +643,27 @@ def verify_recording(
     each set to ``"passed"`` or ``"failed"``, plus ``face_detail``.
     """
     try:
-        try:
-            import cv2
-            from deepface import DeepFace
-        except Exception as error:
-            logger.exception("Importing cv2 or DeepFace failed")
-            raise VerificationUnavailable(
-                f"Local verification models are unavailable: {error}"
-            ) from error
+        if not providers_available():
+            raise VerificationUnavailable("Local verification models are unavailable.")
 
-        frames = [_shrink_frame(frame, cv2) for frame in _video_frames(video_path, cv2)]
-        enrollment_images = [_shrink_frame(image, cv2) for image in _enrollment_images(encoded_samples, cv2)]
+        # 1. Transcribe speech in isolated worker process (memory freed upon exit)
+        transcript = _run_speech_subprocess(video_path)
 
-        # 1. Speech transcription executed first to avoid concurrent peak RAM usage
-        transcript = ""
-        try:
-            transcript = _transcribe_recording(video_path)
-        except Exception as exc:
-            logger.warning("Speech transcription error: %s", exc)
+        # 2. Evaluate face match & liveness in isolated worker process (memory freed upon exit)
+        face_res = _run_face_subprocess(video_path, encoded_samples)
 
-        import gc
-        gc.collect()
-
-        # 2. Face enrollment embeddings and live verification
-        enrollment_vectors = _enrollment_embeddings(DeepFace, cv2, enrollment_images)
-
-        liveness_votes = 0
-        live_frames: list = []
-
-        # Anti-spoofing is expensive; run it on two frames, then detect faces only.
-        for index, frame in enumerate(frames):
-            anti_spoofing = index < 2
-            detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=anti_spoofing)
-            if not detected and anti_spoofing:
-                detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=False)
-            if not (detected and len(detected) == 1):
-                continue
-            best = detected[0]
-            if anti_spoofing and bool(best.get("is_real", False)):
-                liveness_votes += 1
-                live_frames.append(frame)
-            elif (not anti_spoofing) or best.get("confidence", 0) > 0.4:
-                live_frames.append(frame)
-
-        if not live_frames:
-            logger.warning(
-                "Anti-spoofing returned no usable frames; falling back to plain face detection."
-            )
-            for frame in frames:
-                detected = _safe_extract_faces(DeepFace, frame, anti_spoofing=False)
-                if detected and len(detected) == 1:
-                    live_frames.append(frame)
-
-        identity_votes = 0
-        frames_attempted = 0
-        for frame in live_frames:
-            try:
-                live_embedding = _embedding_from_frame(DeepFace, cv2, frame)
-            except Exception as exc:
-                logger.debug("Live face embedding failed for a frame: %s", exc)
-                continue
-            if live_embedding is None:
-                continue
-            frames_attempted += 1
-            if _identity_matches_enrollment(live_embedding, enrollment_vectors):
-                identity_votes += 1
-
-        gc.collect()
-
-        # ── Thresholds ───────────────────────────────────────────────────────────
-        # Require at least 1 liveness vote out of collected frames (lenient – the
-        # browser clip may be short and frames few).
-        liveness_threshold = 1
-        face_status, face_detail = _decide_face_outcome(identity_votes, frames_attempted)
-        identity_threshold = max(2, math.ceil(max(frames_attempted, 1) * 0.6))
-
-        liveness_status = "passed" if liveness_votes >= liveness_threshold else "failed"
         speech_status = "passed" if _phrase_matches(sentence, transcript) else "failed"
 
-        logger.info(
-            "Verification result – face: %s (%s, %d/%d votes, need %d), liveness: %s (%d votes), speech: %s",
-            face_status, face_detail, identity_votes, frames_attempted, identity_threshold,
-            liveness_status, liveness_votes,
-            speech_status,
-        )
-
         result = {
-            "face_status": face_status,
-            "face_detail": face_detail,
-            "liveness_status": liveness_status,
+            "face_status": face_res.get("face_status", "failed"),
+            "face_detail": face_res.get("face_detail", "no_face"),
+            "liveness_status": face_res.get("liveness_status", "failed"),
             "speech_status": speech_status,
         }
-        required = {"face_status", "liveness_status", "speech_status"}
-        if not isinstance(result, dict) or not required.issubset(result):
-            raise VerificationUnavailable("Local verification produced an incomplete result.")
+        logger.info(
+            "Verification result – face: %s (%s), liveness: %s, speech: %s",
+            result["face_status"], result["face_detail"], result["liveness_status"], result["speech_status"]
+        )
         return result
     except VerificationUnavailable:
         raise

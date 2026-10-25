@@ -3686,7 +3686,8 @@ def create_checkin(
     user: dict = Depends(current_user),
 ):
     t_start = time.perf_counter()
-    logger.info("[CHECKIN] request received")
+    logger.info("[CHECKIN] Request received")
+    logger.info("[CHECKIN] Authentication verified")
     logger.info("[CHECKIN] authenticated owner: %s", user["id"])
     if sentence not in CHECKIN_SENTENCES:
         logger.warning("[CHECKIN ERROR] The check-in phrase is not valid.")
@@ -3697,8 +3698,10 @@ def create_checkin(
             status_code=503,
             content={
                 "success": False,
+                "checkin_saved": False,
+                "verification_unavailable": True,
                 "status": "verification_unavailable",
-                "message": "Live verification services are currently unavailable.",
+                "message": "Live verification services are temporarily unavailable.",
                 "checks": {
                     "face": "unavailable",
                     "liveness": "unavailable",
@@ -3718,7 +3721,7 @@ def create_checkin(
         logger.warning("[CHECKIN ERROR] Recording exceeds 20MB limit")
         raise HTTPException(status_code=413, detail="Check-in recordings must be 20 MB or smaller.")
     
-    logger.info("[CHECKIN] recording received")
+    logger.info("[CHECKIN] Recording received")
     logger.info("[CHECKIN] recording size: %d bytes", len(data))
 
     with db() as connection:
@@ -3738,13 +3741,14 @@ def create_checkin(
     with tempfile.TemporaryDirectory(prefix="cloudguard-checkin-") as directory:
         video_path = Path(directory) / f"recording{suffix}"
         video_path.write_bytes(data)
-        logger.info("[CHECKIN] temporary file created")
+        logger.info("[CHECKIN] Temporary file created")
         t_upload = time.perf_counter() - t_start
         try:
             statuses = verify_recording(video_path, enrollment_samples, sentence)
             required = {"face_status", "liveness_status", "speech_status"}
             if not isinstance(statuses, dict) or not required.issubset(statuses):
                 raise VerificationUnavailable("Local verification produced an incomplete result.")
+            logger.info("[CHECKIN] All verification checks completed")
         except ValueError as error:
             logger.warning("[CHECKIN ERROR] %s", error)
             raise HTTPException(status_code=422, detail=str(error)) from error
@@ -3754,8 +3758,10 @@ def create_checkin(
                 status_code=503,
                 content={
                     "success": False,
+                    "checkin_saved": False,
+                    "verification_unavailable": True,
                     "status": "verification_unavailable",
-                    "message": str(error) or "Live verification services are currently unavailable.",
+                    "message": str(error) or "Live verification services are temporarily unavailable.",
                     "checks": {
                         "face": "unavailable",
                         "liveness": "unavailable",
@@ -3769,6 +3775,8 @@ def create_checkin(
                 status_code=503,
                 content={
                     "success": False,
+                    "checkin_saved": False,
+                    "verification_unavailable": True,
                     "status": "verification_unavailable",
                     "message": "Local verification could not complete. No result was saved; check the API log and try again.",
                     "checks": {
@@ -3778,6 +3786,8 @@ def create_checkin(
                     },
                 },
             )
+        finally:
+            logger.info("[CHECKIN] Temporary recording deleted")
 
     passed = all(statuses.get(check) == "passed" for check in ("face_status", "liveness_status", "speech_status"))
     checkin_status = "success" if passed else "failed"
@@ -3796,7 +3806,7 @@ def create_checkin(
     elif not passed and statuses.get("speech_status") != "passed":
         message = "Voice verification failed: spoken phrase did not match the expected phrase."
     elif passed:
-        message = "Check-in verified successfully."
+        message = "Live check-in completed successfully."
     else:
         message = "One or more verification checks did not pass."
 
@@ -3804,6 +3814,7 @@ def create_checkin(
         logger.warning("[CHECKIN ERROR] %s", message)
 
     t_db_start = time.perf_counter()
+    logger.info("[CHECKIN] Database check-in being saved")
     with db() as connection:
         cursor = connection.execute(
             """INSERT INTO checkins(owner_id,mode,status,face_status,liveness_status,speech_status,sentence,created_at)
@@ -3861,7 +3872,7 @@ def create_checkin(
                 )
                 audit(connection, user["id"], "medical_hold.fresh_checkin_completed")
 
-            logger.info("[CHECKIN] check-in saved")
+            logger.info("[CHECKIN] Check-in saved")
 
         row = connection.execute("SELECT * FROM checkins WHERE id=?", (cursor.lastrowid,)).fetchone()
     t_db = time.perf_counter() - t_db_start
@@ -3876,10 +3887,14 @@ def create_checkin(
         "[TIMING] upload=%.3fs face=%.3fs liveness=%.3fs speech=%.3fs database=%.3fs total=%.3fs",
         t_upload, t_face, t_liveness, t_speech, t_db, t_total
     )
-    logger.info("[CHECKIN] response being returned")
+    logger.info("[CHECKIN] Response returned")
 
     checkin = dict(row)
     checkin["face_detail"] = face_detail
+
+    face_match = (statuses.get("face_status") == "passed")
+    liveness_passed = (statuses.get("liveness_status") == "passed")
+    speech_match = (statuses.get("speech_status") == "passed")
 
     checks = {
         "face": statuses.get("face_status", "failed"),
@@ -3892,7 +3907,11 @@ def create_checkin(
             "success": True,
             "passed": True,
             "status": "verified",
-            "message": "Check-in verified successfully.",
+            "checkin_saved": True,
+            "face_match": face_match,
+            "liveness_passed": liveness_passed,
+            "speech_match": speech_match,
+            "message": "Live check-in completed successfully.",
             "checks": checks,
             "checkin": checkin,
             "checkin_time": now_str,
@@ -3903,7 +3922,11 @@ def create_checkin(
             "success": False,
             "passed": False,
             "status": "failed",
-            "message": "Check-in verification failed.",
+            "checkin_saved": True,
+            "face_match": face_match,
+            "liveness_passed": liveness_passed,
+            "speech_match": speech_match,
+            "message": message,
             "failure_reason": message,
             "checks": checks,
             "checkin": checkin,

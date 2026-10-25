@@ -2925,40 +2925,45 @@ function Checkin({ token, onComplete, onNavigate }) {
       form.append('sentence', sentence)
       form.append('recording', clip, `check-in.${clip.type.includes('mp4') ? 'mp4' : 'webm'}`)
 
-      // 65-second client timeout ensures the UI is never permanently stuck in 'submitting'
+      // 90-second client timeout ensures the UI is never permanently stuck in 'submitting'
       const response = await api('/check-ins', {
         token,
         method: 'POST',
         body: form,
-        timeoutMs: 65000,
+        timeoutMs: 90000,
       })
 
       if (!response) {
         throw new Error('No response received from verification server.')
       }
 
-      if (response.status === 'verification_unavailable' || response.checks?.face === 'unavailable') {
+      if (response.status === 'verification_unavailable' || response.verification_unavailable || response.checks?.face === 'unavailable') {
         setState('unavailable')
         setVerificationResult({
           status: 'unavailable',
-          message: response.message || 'Live verification services are currently unavailable.',
+          message: response.message || 'Live verification services are temporarily unavailable.',
           checks: { face: 'unavailable', liveness: 'unavailable', voice: 'unavailable' },
         })
         return
       }
 
-      const isPassed = Boolean(response.success || response.passed || response.status === 'success' || response.status === 'verified')
+      const isPassed = Boolean(
+        response.success === true &&
+        (response.passed === true || response.status === 'verified' || response.status === 'success' || (response.face_match && response.liveness_passed && response.speech_match))
+      )
+
+      const checksObj = {
+        face: (response.face_match || response.checks?.face === 'passed' || response.checkin?.face_status === 'passed') ? 'passed' : 'failed',
+        liveness: (response.liveness_passed || response.checks?.liveness === 'passed' || response.checkin?.liveness_status === 'passed') ? 'passed' : 'failed',
+        voice: (response.speech_match || response.checks?.voice === 'passed' || response.checkin?.speech_status === 'passed') ? 'passed' : 'failed',
+      }
 
       if (isPassed) {
         setState('success')
         setVerificationResult({
           status: 'success',
-          message: 'Check-in verified successfully.',
-          checks: {
-            face: response.checks?.face || response.checkin?.face_status || 'passed',
-            liveness: response.checks?.liveness || response.checkin?.liveness_status || 'passed',
-            voice: response.checks?.voice || response.checkin?.speech_status || 'passed',
-          },
+          message: 'Live check-in completed successfully.',
+          checks: checksObj,
           checkinTime: response.checkin_time || response.checkin?.created_at || new Date().toISOString(),
           nextDeadline: response.next_checkin_deadline || null,
           checkin: response.checkin,
@@ -2971,13 +2976,9 @@ function Checkin({ token, onComplete, onNavigate }) {
         setState('failed')
         setVerificationResult({
           status: 'failed',
-          message: 'Check-in verification failed.',
+          message: 'Verification failed. Please try again.',
           failureReason: response.failure_reason || response.message || 'Face, liveness, or voice check did not pass.',
-          checks: {
-            face: response.checks?.face || response.checkin?.face_status || 'failed',
-            liveness: response.checks?.liveness || response.checkin?.liveness_status || 'failed',
-            voice: response.checks?.voice || response.checkin?.speech_status || 'failed',
-          },
+          checks: checksObj,
           checkin: response.checkin,
         })
         if (onComplete && response.checkin) {
@@ -2986,22 +2987,31 @@ function Checkin({ token, onComplete, onNavigate }) {
       }
     } catch (requestError) {
       const errData = requestError.data || {}
-      if (errData.status === 'verification_unavailable' || requestError.status === 503) {
+      const status = requestError.status
+      if (errData.status === 'verification_unavailable' || errData.verification_unavailable || status === 503) {
         setState('unavailable')
         setVerificationResult({
           status: 'unavailable',
-          message: errData.message || 'Live verification services are currently unavailable.',
+          message: errData.message || 'Live verification services are temporarily unavailable.',
           checks: { face: 'unavailable', liveness: 'unavailable', voice: 'unavailable' },
         })
       } else {
         setState('failed')
-        const isTimeout = requestError.message?.includes('taking too long') || requestError.name === 'TimeoutError'
-        const failMsg = isTimeout
-          ? 'Verification is taking too long. Please try again.'
-          : (requestError.message || 'Check-in verification failed. Please try again.')
+        let failMsg = 'Verification failed. Please try again.'
+        if (requestError.message?.includes('taking too long') || requestError.name === 'TimeoutError' || status === 408) {
+          failMsg = 'Verification took too long. Please try again.'
+        } else if (status === 500) {
+          failMsg = 'Live verification service encountered an error. Please try again.'
+        } else if (status === 422) {
+          failMsg = errData.detail || 'Unable to process the recording. Please record again.'
+        } else if (status === 401) {
+          failMsg = 'Your session has expired. Please sign in again.'
+        } else if (requestError.message) {
+          failMsg = requestError.message
+        }
         setVerificationResult({
           status: 'failed',
-          message: 'Check-in verification failed.',
+          message: 'Verification failed. Please try again.',
           failureReason: failMsg,
           checks: { face: 'failed', liveness: 'failed', voice: 'failed' },
         })

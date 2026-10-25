@@ -146,13 +146,15 @@ def _frames_from_av(video_path: Path) -> list:
         else:
             kept = []
             for index, frame in enumerate(container.decode(video=0)):
-                if index % 10 == 0:
+                if index % 25 == 0:
                     array = _array_from_av_frame(frame)
                     if array is not None:
                         kept.append(array)
-                if index > 280:
+                        if len(kept) >= 4:
+                            break
+                if index > 150:
                     break
-            frames = [kept[index] for index in _sampled_indexes(len(kept))] if len(kept) >= 2 else kept
+            frames = kept if len(kept) >= 2 else ([kept[index] for index in _sampled_indexes(len(kept))] if kept else [])
     if len(frames) < 2:
         raise ValueError("The recording could not be decoded reliably. Please record again.")
     return frames
@@ -272,11 +274,16 @@ def _whisper_model_name() -> str:
 def _speech_model():
     from faster_whisper import WhisperModel
 
-    return WhisperModel(
+    logger.info("[MODEL] Loading Whisper...")
+    print("[MODEL] Loading Whisper...", flush=True)
+    model = WhisperModel(
         _whisper_model_name(),
         device="cpu",
         compute_type="int8",
     )
+    logger.info("[MODEL] Whisper loaded")
+    print("[MODEL] Whisper loaded", flush=True)
+    return model
 
 
 def _shrink_frame(frame, cv2, max_side: int = _MAX_FRAME_SIDE):
@@ -568,7 +575,11 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
     """Evaluate face match and liveness in an isolated worker process."""
     try:
         import cv2
+        logger.info("[MODEL] Loading FaceNet...")
+        print("[MODEL] Loading FaceNet...", flush=True)
         from deepface import DeepFace
+        logger.info("[MODEL] FaceNet loaded")
+        print("[MODEL] FaceNet loaded", flush=True)
     except Exception as error:
         logger.exception("Importing cv2 or DeepFace failed")
         raise VerificationUnavailable(
@@ -747,7 +758,7 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
         face_result = None
         for line in proc.stdout.splitlines():
             line_str = line.strip()
-            if line_str.startswith("[FACE]"):
+            if line_str.startswith("[FACE]") or line_str.startswith("[MODEL]") or line_str.startswith("[CHECKIN]"):
                 logger.info(line_str)
             elif line_str.startswith("__FACE_RESULT__:"):
                 face_result = json.loads(line_str.split("__FACE_RESULT__:", 1)[1].strip())
@@ -779,21 +790,21 @@ def verify_recording(
 
         # 1. Face verification & liveness in isolated worker process (memory freed upon exit)
         t_face_start = time.perf_counter()
-        logger.info("[CHECKIN] face verification started")
+        logger.info("[CHECKIN] Face verification started")
         face_res = _run_face_subprocess(video_path, encoded_samples)
-        logger.info("[CHECKIN] face verification completed")
+        logger.info("[CHECKIN] Face verification completed")
         t_face = time.perf_counter() - t_face_start
 
-        logger.info("[CHECKIN] liveness verification started")
+        logger.info("[CHECKIN] Liveness verification started")
         t_liveness = float(face_res.get("t_liveness", 0.005))
-        logger.info("[CHECKIN] liveness verification completed")
+        logger.info("[CHECKIN] Liveness verification completed")
 
         # 2. Transcribe speech in isolated worker process (memory freed upon exit)
         t_speech_start = time.perf_counter()
-        logger.info("[CHECKIN] speech verification started")
+        logger.info("[CHECKIN] Speech verification started")
         transcript = _run_speech_subprocess(video_path)
         speech_status = "passed" if _phrase_matches(sentence, transcript) else "failed"
-        logger.info("[CHECKIN] speech verification completed")
+        logger.info("[CHECKIN] Speech verification completed")
         t_speech = time.perf_counter() - t_speech_start
 
         result = {

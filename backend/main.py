@@ -15,7 +15,7 @@ import tempfile
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from urllib.parse import quote, urlencode, urlsplit
 
 import bcrypt
@@ -30,7 +30,13 @@ from fastapi.responses import Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr, Field, StrictInt
 from resend.exceptions import ResendError
-from verification import VerificationUnavailable, providers_available, verify_recording
+from verification import (
+    VerificationUnavailable,
+    preload_verification_models,
+    providers_available,
+    verification_diagnostics,
+    verify_recording,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -79,6 +85,9 @@ async def lifespan(_: FastAPI):
     except Exception as error:
         logger.warning(f"Initial DB check warning: {error}")
     scheduler_task = asyncio.create_task(run_background_scheduler())
+    if providers_available():
+        import threading
+        threading.Thread(target=preload_verification_models, daemon=True, name="model-preload").start()
     try:
         yield
     finally:
@@ -1658,13 +1667,29 @@ def root_status():
 @app.get("/api/health")
 def health() -> dict:
     configured = providers_available()
+    diag = verification_diagnostics()
+    db_connected = False
+    try:
+        with db() as conn:
+            conn.execute("SELECT 1").fetchone()
+            db_connected = True
+    except Exception:
+        db_connected = False
+
     return {
-        "status": "ok",
+        "status": "ok" if db_connected else "degraded",
         "service": "CloudGuard Vault API",
         "version": "1.0.0",
         "database": "postgresql",
+        "database_connected": db_connected,
         "verification_mode": "local" if configured else "unavailable",
         "ai_verification_configured": configured,
+        "verification": {
+            "face": diag["face"],
+            "liveness": diag["liveness"],
+            "speech": diag["speech"],
+            "video_decode": diag["video_decode"],
+        },
     }
 
 
@@ -3654,7 +3679,7 @@ def create_checkin(
     if not providers_available():
         raise HTTPException(
             status_code=503,
-            detail="Local face, liveness, and speech verification dependencies are unavailable. No check-in was saved.",
+            detail="Live verification is temporarily unavailable. The server is missing verification dependencies.",
         )
     suffix = Path(recording.filename or "").suffix.lower()
     if suffix not in {".webm", ".mp4", ".mov"}:

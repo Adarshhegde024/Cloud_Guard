@@ -31,7 +31,8 @@ class VerificationUnavailable(RuntimeError):
     pass
 
 
-def providers_available() -> bool:
+def verification_diagnostics() -> dict[str, bool]:
+    """Inspect availability of individual verification subsystems."""
     from importlib.util import find_spec
 
     engine = os.getenv(
@@ -39,10 +40,50 @@ def providers_available() -> bool:
         os.getenv("CLOUDGUARD_DEEPFACE_ENGINE", "tensorflow"),
     ).lower()
     engine_module = {"tensorflow": "tensorflow", "pytorch": "torch"}.get(engine)
-    required_modules = ("cv2", "deepface", "faster_whisper", "tf_keras")
-    return engine_module is not None and all(
-        find_spec(module) is not None for module in (*required_modules, engine_module)
-    )
+    has_engine = engine_module is not None and find_spec(engine_module) is not None
+    has_cv2 = find_spec("cv2") is not None
+    has_deepface = find_spec("deepface") is not None
+    has_tf_keras = find_spec("tf_keras") is not None
+    has_whisper = find_spec("faster_whisper") is not None
+    has_av = find_spec("av") is not None
+
+    face_ready = bool(has_cv2 and has_deepface and has_tf_keras and has_engine)
+    liveness_ready = bool(face_ready)
+    speech_ready = bool(has_whisper)
+    video_ready = bool(has_av or has_cv2)
+
+    return {
+        "face": face_ready,
+        "liveness": liveness_ready,
+        "speech": speech_ready,
+        "video_decode": video_ready,
+    }
+
+
+def providers_available() -> bool:
+    diag = verification_diagnostics()
+    return bool(diag["face"] and diag["liveness"] and diag["speech"] and diag["video_decode"])
+
+
+def preload_verification_models() -> None:
+    """Pre-warm Whisper and DeepFace models so the first check-in does not encounter a cold-load delay."""
+    if not providers_available():
+        logger.info("Verification dependencies unavailable; skipping model preload.")
+        return
+    try:
+        logger.info("Pre-warming speech model (%s)...", _whisper_model_name())
+        _speech_model()
+        logger.info("Speech model pre-warmed successfully.")
+    except Exception as exc:
+        logger.warning("Could not pre-warm speech model: %s", exc)
+
+    try:
+        from deepface import DeepFace
+        logger.info("Pre-warming DeepFace %s model...", FACE_MODEL)
+        DeepFace.build_model(FACE_MODEL)
+        logger.info("DeepFace %s model pre-warmed successfully.", FACE_MODEL)
+    except Exception as exc:
+        logger.warning("Could not pre-warm DeepFace model: %s", exc)
 
 
 def _sampled_indexes(count: int) -> list[int]:

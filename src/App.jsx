@@ -2793,7 +2793,16 @@ function Checkin({ token, onComplete }) {
   useEffect(() => {
     let active = true
     api('/health')
-      .then((health) => { if (active) setVerificationReady(health.ai_verification_configured === true) })
+      .then((health) => {
+        if (active) {
+          const ready = Boolean(
+            health.verification
+              ? (health.verification.face && health.verification.liveness && health.verification.speech)
+              : health.ai_verification_configured
+          )
+          setVerificationReady(ready)
+        }
+      })
       .catch(() => { if (active) setVerificationReady(false) })
     return () => { active = false }
   }, [])
@@ -2887,7 +2896,14 @@ function Checkin({ token, onComplete }) {
       setStep('result')
       await onComplete(response.checkin)
     } catch (requestError) {
-      setError(requestError.message || 'Check-in verification failed. Please try again.')
+      const msg = requestError.message || ''
+      if (msg.includes('unavailable') || msg.includes('503') || requestError.status === 503) {
+        setError('Live verification is temporarily unavailable. Please try again later.')
+      } else if (msg.includes('did not pass') || msg.includes('failed') || requestError.status === 422) {
+        setError('Verification failed. Please make sure your face is clearly visible, look directly into the camera, and repeat the phrase clearly.')
+      } else {
+        setError(msg || 'Check-in verification failed. Please try again.')
+      }
     }
     finally { setLoading(false) }
   }
@@ -2895,7 +2911,7 @@ function Checkin({ token, onComplete }) {
   const resultCopy = result ? checkinResultCopy(result) : null
 
   return <div className="page-content checkin-page">
-    <div className="verification-banner"><span className="verification-banner-icon"><Icon name="scan" size={18} /></span><span><b>{verificationReady ? 'Local verification is configured' : 'Local verification is unavailable'}</b><small>{verificationReady ? 'This server checks face match, anti-spoofing, and the spoken phrase, then deletes the clip. All three checks must pass; first use may download model weights.' : 'Check-ins require the local face, liveness, and speech models. No result will be recorded unless every check completes.'}</small></span><span className={`verification-indicator ${verificationReady ? 'verification-ready' : ''}`}><span className="live-dot" /> {verificationReady ? 'AI CONFIGURED' : 'UNAVAILABLE'}</span></div>
+    <div className="verification-banner"><span className="verification-banner-icon"><Icon name="scan" size={18} /></span><span><b>{verificationReady ? 'Live AI verification active' : 'Live verification is temporarily unavailable'}</b><small>{verificationReady ? 'CloudGuard verifies face match against your enrollment samples, anti-spoof liveness, and the spoken phrase. All three checks must pass.' : 'Live verification models are currently loading or unavailable. Please try again in a few moments.'}</small></span><span className={`verification-indicator ${verificationReady ? 'verification-ready' : ''}`}><span className="live-dot" /> {verificationReady ? 'AI ACTIVE' : 'UNAVAILABLE'}</span></div>
     <div className="checkin-layout">
       <section className="surface checkin-flow">
         <div className="section-title-row"><div><span className="eyebrow">A MOMENT FOR YOU</span><h3>Complete a check-in</h3></div><span className="checkin-duration"><Icon name="clock" size={14} /> ABOUT 12 SEC</span></div>
@@ -2912,7 +2928,7 @@ function Checkin({ token, onComplete }) {
         {step === 'ready' && <button className="button button-primary" onClick={openCamera}>Begin check-in <Icon name="arrow" size={17} /></button>}
         {step === 'camera' && <div className="phrase-panel"><div className="button-row"><button className="button button-primary" onClick={startRecording}><span className="record-dot" /> Start 12-second recording</button><button className="button button-quiet" onClick={stopCamera}>Cancel</button></div></div>}
         {step === 'recording' && <div className="recording-panel"><span className="recording-pulse" /><b>Recording — read the phrase above aloud</b><span className="timer-count">{seconds}<small>sec</small></span><div className="recording-progress-bar"><span style={{ width: `${((12 - seconds) / 12) * 100}%` }} /></div><small>Speak naturally and keep your face centred in the camera.</small></div>}
-        {step === 'recorded' && <div className="phrase-panel"><span className="eyebrow">RECORDING COMPLETE</span><div className="checkin-privacy"><Icon name="shield" size={15} /><span>{hasClip ? 'Submit the clip to run face, liveness, and speech checks. The server deletes it after analysis.' : 'No recording data was captured. Please record again.'}</span></div><div className="button-row"><button className="button button-primary" onClick={saveCheckin} disabled={loading || !hasClip}>{loading ? 'Verifying… about a minute on first use' : 'Verify check-in'} <Icon name="arrow" size={17} /></button><button className="button button-quiet" onClick={() => { setStep('camera'); setResult(null); setHasClip(false); recordingClip.current = null }}>Try again</button></div></div>}
+        {step === 'recorded' && <div className="phrase-panel"><span className="eyebrow">RECORDING COMPLETE</span><div className="checkin-privacy"><Icon name="shield" size={15} /><span>{hasClip ? 'Submit the clip to run face, liveness, and speech checks. The server deletes it after analysis.' : 'No recording data was captured. Please record again.'}</span></div><div className="button-row"><button className="button button-primary" onClick={saveCheckin} disabled={loading || !hasClip}>{loading ? 'Analyzing face, liveness & voice…' : 'Verify check-in'} <Icon name="arrow" size={17} /></button><button className="button button-quiet" onClick={() => { setStep('camera'); setResult(null); setHasClip(false); recordingClip.current = null }}>Try again</button></div></div>}
         {step === 'result' && result && resultCopy && <div className="result-panel"><span className="result-checkin-icon"><Icon name="shield" size={23} /></span><span className="eyebrow">CHECK-IN RESULT</span><h3>{resultCopy.title}</h3><p>{resultCopy.summary}</p><div className="overall-result"><span>Verification status</span><b>{result.status === 'success' ? 'PASSED' : 'FAILED'}</b></div><div className="result-checks"><div><span>Face verification</span><b className={result.face_status === 'passed' ? 'available-status' : 'unavailable-status'}>{resultCopy.faceLabel}</b></div><div><span>Anti-spoof liveness</span><b className={result.liveness_status === 'passed' ? 'available-status' : 'unavailable-status'}>{result.liveness_status === 'passed' ? 'Passed' : 'Not passed'}</b></div><div><span>Speech match</span><b className={result.speech_status === 'passed' ? 'available-status' : 'unavailable-status'}>{result.speech_status === 'passed' ? 'Passed' : 'Not passed'}</b></div></div><small className="result-time">Saved {formatDate(result.created_at, { dateStyle: 'medium', timeStyle: 'short' })}</small>{result.status !== 'success' && <div className="result-hints">{[['face_status', resultCopy.faceHint],['liveness_status','Liveness check failed. Use a live camera, not a photo or screen replay.'],['speech_status','Speech not matched. Speak the phrase clearly at a normal pace, close to the microphone.']].filter(([key]) => result[key] !== 'passed').map(([key, hint]) => <div key={key} className="result-hint-item"><Icon name="close" size={14} /><span>{hint}</span></div>)}</div>}<div className="button-row" style={{marginTop:'12px'}}><button className="button button-secondary" onClick={() => { stopCamera(); setResult(null) }}>Done</button>{result.status !== 'success' && <button className="button button-quiet" onClick={() => { setStep('camera'); setResult(null); setHasClip(false); recordingClip.current = null }}>Try again</button>}</div></div>}
         <video className={`checkin-video ${streamOn ? 'video-visible' : ''}`} ref={videoRef} muted playsInline />
       </section>

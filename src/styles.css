@@ -2204,3 +2204,78 @@ input:disabled { background: #f8f8fb; color: #858b98; }
 @keyframes oauthSpin {
   to { transform: rotate(360deg); }
 }
+
+/* Live Check-in Permission UI */
+.permission-panel {
+  padding: 20px;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #ffffff;
+  margin: 14px 0;
+}
+.permission-header h3 {
+  margin: 6px 0 8px;
+  font-size: 18px;
+  font-weight: 700;
+  color: #1e293b;
+}
+.permission-header p {
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.6;
+  margin: 0 0 16px;
+}
+.permission-requirements {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 16px 0;
+}
+.permission-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 9px;
+}
+.permission-item-content {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.permission-item-content b {
+  font-size: 14px;
+  color: #1e293b;
+}
+.permission-item-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 6px;
+  background: #eff6ff;
+  color: #2563eb;
+  border: 1px solid #bfdbfe;
+}
+.permission-alert {
+  padding: 14px 16px;
+  border-radius: 10px;
+  margin: 14px 0;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
+}
+.permission-alert h4 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 700;
+  color: #991b1b;
+}
+.permission-alert p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #b91c1c;
+}

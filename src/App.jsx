@@ -2821,8 +2821,10 @@ function Checkin({ token, onComplete, onNavigate }) {
   const recorderRef = useRef(null)
   const timerRef = useRef(null)
 
-  // Explicit state management: 'idle' | 'permission_request' | 'ready' | 'recording' | 'recorded' | 'submitting' | 'processing' | 'success' | 'failed' | 'unavailable'
+  // Explicit state machine:
+  // 'idle' -> 'permission_request' -> 'ready' -> 'recording' -> 'recorded' -> 'submitting' -> 'processing' -> 'success' / 'failed' / 'unavailable'
   const [state, setState] = useState('idle')
+  const [permissionError, setPermissionError] = useState(null)
   const [streamOn, setStreamOn] = useState(false)
   const [seconds, setSeconds] = useState(12)
   const [sentence, setSentence] = useState(SENTENCES[0])
@@ -2831,7 +2833,7 @@ function Checkin({ token, onComplete, onNavigate }) {
   const [verificationResult, setVerificationResult] = useState(null)
   const recordingChunks = useRef([])
   const recordingClip = useRef(null)
-  const [verificationReady, setVerificationReady] = useState(null)
+  const [verificationReady, setVerificationReady] = useState(true)
 
   useEffect(() => () => {
     window.clearInterval(timerRef.current)
@@ -2856,36 +2858,102 @@ function Checkin({ token, onComplete, onNavigate }) {
   }, [])
 
   async function requestPermissions() {
+    setPermissionError(null)
     setError('')
     setVerificationResult(null)
     setState('permission_request')
+
+    console.log('[CHECKIN] permission request started')
     console.log('[CHECKIN] requesting camera + microphone')
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError('Camera and microphone access require a secure browser context (HTTPS or localhost).')
+
+    // 1. Check for secure context
+    if (typeof window !== 'undefined' && !window.isSecureContext && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+      console.warn('[CHECKIN] insecure context detected')
+      setPermissionError({
+        title: 'HTTPS Required',
+        message: 'Camera and microphone access require a secure browser context (HTTPS or localhost).',
+      })
       setState('idle')
       return
     }
+
+    // 2. Check for mediaDevices API support
+    if (!navigator.mediaDevices?.getUserMedia) {
+      console.warn('[CHECKIN] mediaDevices not supported')
+      setPermissionError({
+        title: 'Browser Not Supported',
+        message: 'This browser does not support media devices. Please use an updated version of Chrome, Edge, or Firefox.',
+      })
+      setState('idle')
+      return
+    }
+
+    // 3. Pre-check permissions status if supported
+    if (navigator.permissions?.query) {
+      try {
+        const camPerm = await navigator.permissions.query({ name: 'camera' })
+        const micPerm = await navigator.permissions.query({ name: 'microphone' })
+        console.log(`[CHECKIN] permission state: camera=${camPerm.state}, microphone=${micPerm.state}`)
+        if (camPerm.state === 'denied' && micPerm.state === 'denied') {
+          setPermissionError({
+            title: 'Camera and microphone permissions are required',
+            message: 'Please allow camera and microphone access in your browser settings and try again.',
+          })
+          setState('idle')
+          return
+        }
+        if (camPerm.state === 'denied') {
+          setPermissionError({
+            title: 'Camera permission is required',
+            message: 'Please allow camera access in your browser settings and try again.',
+          })
+          setState('idle')
+          return
+        }
+        if (micPerm.state === 'denied') {
+          setPermissionError({
+            title: 'Microphone permission is required',
+            message: 'Please allow microphone access in your browser settings and try again.',
+          })
+          setState('idle')
+          return
+        }
+      } catch (qErr) {
+        // Permissions query might throw in Firefox or unsupported browsers; continue to getUserMedia
+      }
+    }
+
+    // 4. Authoritative getUserMedia call
     try {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop())
+        streamRef.current = null
+      }
+
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: { echoCancellation: true, noiseSuppression: true },
       })
+
+      console.log('[CHECKIN] getUserMedia success')
+
       const videoTracks = stream.getVideoTracks()
       const audioTracks = stream.getAudioTracks()
 
-      console.log('[CHECKIN] camera permission granted')
-      console.log('[CHECKIN] microphone permission granted')
       console.log(`[CHECKIN] video tracks: ${videoTracks.length}`)
       console.log(`[CHECKIN] audio tracks: ${audioTracks.length}`)
 
       if (videoTracks.length === 0 || videoTracks[0].readyState !== 'live') {
         stream.getTracks().forEach((t) => t.stop())
-        throw new Error('Camera access is required for live verification.')
+        throw new Error('Camera permission is required. Please allow camera access in your browser settings and try again.')
       }
+      console.log('[CHECKIN] camera permission granted')
+
       if (audioTracks.length === 0 || audioTracks[0].readyState !== 'live') {
         stream.getTracks().forEach((t) => t.stop())
-        throw new Error('Microphone access is required because CloudGuard must verify your spoken phrase.')
+        throw new Error('Microphone permission is required. Please allow microphone access in your browser settings and try again.')
       }
+      console.log('[CHECKIN] microphone permission granted')
 
       streamRef.current = stream
       if (videoRef.current) {
@@ -2894,7 +2962,7 @@ function Checkin({ token, onComplete, onNavigate }) {
       }
       setStreamOn(true)
 
-      // Fetch a phrase from the server or use a random one from SENTENCES
+      // Fetch a phrase from the server or use a random fallback
       try {
         const phraseRes = await api('/check-ins/phrase', { timeoutMs: 5000 })
         if (phraseRes?.sentence) {
@@ -2905,31 +2973,68 @@ function Checkin({ token, onComplete, onNavigate }) {
       } catch {
         setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
       }
+
+      console.log('[CHECKIN] entering READY state')
       setState('ready')
     } catch (permError) {
-      console.error('[CHECKIN] permission error:', permError)
-      let camOk = false
-      let micOk = false
-      try {
-        const v = await navigator.mediaDevices.getUserMedia({ video: true })
-        v.getTracks().forEach((t) => t.stop())
-        camOk = true
-      } catch {}
-      try {
-        const a = await navigator.mediaDevices.getUserMedia({ audio: true })
-        a.getTracks().forEach((t) => t.stop())
-        micOk = true
-      } catch {}
+      console.error(`[CHECKIN] getUserMedia error: ${permError.name || 'Error'}`)
+      console.error(permError)
 
-      if (!camOk && micOk) {
-        setError('Camera access is required for live verification.')
-      } else if (camOk && !micOk) {
-        setError('Microphone access is required because CloudGuard must verify your spoken phrase.')
-      } else {
-        setError(permError.message && !permError.message.includes('object')
-          ? permError.message
-          : 'Camera and microphone access are required to perform a live check-in. Please allow permissions in your browser and try again.')
+      let title = 'Permission required'
+      let message = 'Camera and microphone access are required to perform a live check-in. Please allow permissions in your browser and try again.'
+
+      let camState = 'prompt'
+      let micState = 'prompt'
+      if (navigator.permissions?.query) {
+        try {
+          const cam = await navigator.permissions.query({ name: 'camera' })
+          camState = cam.state
+        } catch {}
+        try {
+          const mic = await navigator.permissions.query({ name: 'microphone' })
+          micState = mic.state
+        } catch {}
       }
+      console.log(`[CHECKIN] permission state: camera=${camState}, microphone=${micState}`)
+
+      const errName = permError.name || ''
+      const errMsg = (permError.message || '').toLowerCase()
+
+      if (camState === 'denied' && micState !== 'denied') {
+        title = 'Camera permission is required'
+        message = 'Please allow camera access in your browser settings and try again.'
+      } else if (micState === 'denied' && camState !== 'denied') {
+        title = 'Microphone permission is required'
+        message = 'Please allow microphone access in your browser settings and try again.'
+      } else if (camState === 'denied' && micState === 'denied') {
+        title = 'Camera and microphone permissions are required'
+        message = 'Please allow camera and microphone access in your browser settings and try again.'
+      } else if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError') {
+        if (errMsg.includes('camera') && !errMsg.includes('microphone')) {
+          title = 'Camera permission is required'
+          message = 'Please allow camera access in your browser settings and try again.'
+        } else if (errMsg.includes('microphone') && !errMsg.includes('camera')) {
+          title = 'Microphone permission is required'
+          message = 'Please allow microphone access in your browser settings and try again.'
+        } else {
+          title = 'Camera and microphone permissions are required'
+          message = 'Please allow camera and microphone access in your browser settings and try again.'
+        }
+      } else if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError') {
+        title = 'Device not found'
+        message = 'No camera or microphone was found on this device. Please connect a camera and microphone, then try again.'
+      } else if (errName === 'NotReadableError' || errName === 'TrackStartError') {
+        title = 'Hardware in use'
+        message = 'Your camera or microphone is already in use by another application. Please close other video apps and try again.'
+      } else if (errName === 'SecurityError') {
+        title = 'Security restriction'
+        message = 'Camera and microphone access require a secure browser context (HTTPS or localhost).'
+      } else if (permError.message && !permError.message.includes('object')) {
+        message = permError.message
+      }
+
+      setPermissionError({ title, message })
+      setError(message)
       setStreamOn(false)
       setState('idle')
     }
@@ -2937,7 +3042,9 @@ function Checkin({ token, onComplete, onNavigate }) {
 
   function startRecording() {
     setError('')
+    setPermissionError(null)
     setVerificationResult(null)
+
     const stream = streamRef.current
     if (!stream || !window.MediaRecorder) {
       setError('This browser cannot record a check-in. Try the latest version of Chrome, Edge or Firefox.')
@@ -2946,9 +3053,24 @@ function Checkin({ token, onComplete, onNavigate }) {
 
     const vTrack = stream.getVideoTracks()[0]
     const aTrack = stream.getAudioTracks()[0]
-    if (!vTrack || vTrack.readyState !== 'live' || !aTrack || aTrack.readyState !== 'live') {
-      setError('Camera or microphone disconnected. Please click "Allow camera & microphone" again.')
+    if (!vTrack || vTrack.readyState !== 'live') {
+      console.warn('[CHECKIN] video track not live')
+      setPermissionError({
+        title: 'Camera permission is required',
+        message: 'Please allow camera access in your browser settings and try again.',
+      })
       stopCamera()
+      setState('idle')
+      return
+    }
+    if (!aTrack || aTrack.readyState !== 'live') {
+      console.warn('[CHECKIN] audio track not live')
+      setPermissionError({
+        title: 'Microphone permission is required',
+        message: 'Please allow microphone access in your browser settings and try again.',
+      })
+      stopCamera()
+      setState('idle')
       return
     }
 
@@ -2969,7 +3091,7 @@ function Checkin({ token, onComplete, onNavigate }) {
         console.log('[CHECKIN] recording stopped')
         const clip = new Blob(recordingChunks.current, { type: recorder.mimeType || 'video/webm' })
         recordingClip.current = clip
-        console.log(`[CHECKIN] blob size: ${clip.size}`)
+        console.log(`[CHECKIN] recorded blob size: ${clip.size}`)
         if (clip.size > 0) {
           setHasClip(true)
           setState('recorded')
@@ -3013,44 +3135,26 @@ function Checkin({ token, onComplete, onNavigate }) {
     recordingClip.current = null
   }
 
-  async function handleTryAgain() {
+  function handleTryAgain() {
     setError('')
+    setPermissionError(null)
     setVerificationResult(null)
     setHasClip(false)
     recordingClip.current = null
-    const stream = streamRef.current
-    const vTrack = stream?.getVideoTracks()[0]
-    const aTrack = stream?.getAudioTracks()[0]
-
-    // Fetch new phrase
-    try {
-      const phraseRes = await api('/check-ins/phrase', { timeoutMs: 5000 })
-      if (phraseRes?.sentence) {
-        setSentence(phraseRes.sentence)
-      } else {
-        setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
-      }
-    } catch {
-      setSentence(SENTENCES[Math.floor(Math.random() * SENTENCES.length)])
-    }
-
-    if (stream && vTrack?.readyState === 'live' && aTrack?.readyState === 'live') {
-      setState('ready')
-    } else {
-      requestPermissions()
-    }
+    stopCamera()
+    setState('idle')
   }
 
   async function saveCheckin() {
     setError('')
     setState('submitting')
+    console.log('[CHECKIN] submitting check-in')
 
     try {
       const clip = recordingClip.current
       if (!clip || !clip.size) {
         throw new Error('No check-in recording is available. Please record again.')
       }
-      console.log('[CHECKIN] submitting recording')
       const form = new FormData()
       form.append('sentence', sentence)
       form.append('recording', clip, `check-in.${clip.type.includes('mp4') ? 'mp4' : 'webm'}`)
@@ -3065,7 +3169,6 @@ function Checkin({ token, onComplete, onNavigate }) {
           timeoutMs: 30000,
         })
       } catch (startErr) {
-        // Fallback to /check-ins?async_mode=true if /check-ins/start is not found
         if (startErr.status === 404) {
           jobResponse = await api('/check-ins?async_mode=true', {
             token,
@@ -3082,7 +3185,6 @@ function Checkin({ token, onComplete, onNavigate }) {
         throw new Error('No response received from verification server.')
       }
 
-      // If server returned direct unavailable response (e.g. providers not ready)
       if (jobResponse.status === 'verification_unavailable' || jobResponse.verification_unavailable || jobResponse.checks?.face === 'unavailable') {
         setState('unavailable')
         setVerificationResult({
@@ -3097,20 +3199,18 @@ function Checkin({ token, onComplete, onNavigate }) {
       const jobId = jobResponse.job_id
 
       if (jobId) {
-        console.log(`[CHECKIN] job created: ${jobId}`)
+        console.log(`[CHECKIN] job id: ${jobId}`)
         setState('processing')
-        // Poll for job completion: max 60 attempts * 2000ms = 120 seconds
         const pollStartTime = Date.now()
         const maxWaitMs = 120000
         while (Date.now() - pollStartTime < maxWaitMs) {
           await new Promise((resolve) => setTimeout(resolve, 2000))
           try {
-            console.log(`[CHECKIN] polling job: ${jobId}`)
+            console.log('[CHECKIN] polling job status')
             const statusRes = await api(`/check-ins/status/${jobId}`, {
               token,
               timeoutMs: 15000,
             })
-            console.log(`[CHECKIN] job status: ${statusRes.status}`)
             if (statusRes.status !== 'processing') {
               response = statusRes
               break
@@ -3135,7 +3235,6 @@ function Checkin({ token, onComplete, onNavigate }) {
           throw new Error('Verification is taking too long. Please try again.')
         }
       } else {
-        // Direct response fallback
         response = jobResponse
       }
 
@@ -3227,249 +3326,292 @@ function Checkin({ token, onComplete, onNavigate }) {
           checks: { face: 'failed', liveness: 'failed', voice: 'failed' },
         })
       }
-    } finally {
-      setState((curr) => (curr === 'submitting' || curr === 'processing' ? 'failed' : curr))
     }
   }
 
-  return <div className="page-content checkin-page">
-    <div className="verification-banner">
-      <span className="verification-banner-icon"><Icon name="scan" size={18} /></span>
-      <span>
-        <b>{verificationReady ? 'Live AI verification active' : 'Live verification is temporarily unavailable'}</b>
-        <small>{verificationReady ? 'CloudGuard verifies face match against your enrollment samples, anti-spoof liveness, and the spoken phrase. All three checks must pass.' : 'Live verification models are currently loading or unavailable. Please try again in a few moments.'}</small>
-      </span>
-      <span className={`verification-indicator ${verificationReady ? 'verification-ready' : ''}`}>
-        <span className="live-dot" /> {verificationReady ? 'AI ACTIVE' : 'UNAVAILABLE'}
-      </span>
-    </div>
-    <div className="checkin-layout">
-      <section className="surface checkin-flow">
-        <div className="section-title-row">
-          <div><span className="eyebrow">A MOMENT FOR YOU</span><h3>Complete a check-in</h3></div>
-          <span className="checkin-duration"><Icon name="clock" size={14} /> ABOUT 12 SEC</span>
-        </div>
-        <div className="checkin-steps">
-          <div className={`checkin-step ${state !== 'idle' && state !== 'permission_request' ? 'step-done' : 'step-current'}`}>
-            <span>01</span><div><b>Allow camera & microphone</b><small>They’re used only for this check-in.</small></div>{(state !== 'idle' && state !== 'permission_request') && <span className="step-check">✓</span>}
-          </div>
-          <div className={`checkin-step ${(state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') ? 'step-done' : state === 'ready' ? 'step-current' : ''}`}>
-            <span>02</span><div><b>Read your personal phrase</b><small>A new phrase is chosen each time.</small></div>{(state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') && <span className="step-check">✓</span>}
-          </div>
-          <div className={`checkin-step ${(state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') ? 'step-done' : state === 'recording' ? 'step-current' : ''}`}>
-            <span>03</span><div><b>Record a short live clip</b><small>Keep your face in frame as you speak.</small></div>{(state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') && <span className="step-check">✓</span>}
-          </div>
-          <div className={`checkin-step ${state === 'success' || state === 'failed' || state === 'unavailable' ? 'step-current' : state === 'submitting' || state === 'processing' ? 'step-active' : ''}`}>
-            <span>04</span><div><b>Review your result</b><small>See whether verification passed.</small></div>{state === 'success' && <span className="step-check">✓</span>}
-          </div>
-        </div>
+  return (
+    <div className="page-content checkin-page">
+      <div className="verification-banner">
+        <span className="verification-banner-icon"><Icon name="scan" size={18} /></span>
+        <span>
+          <b>{verificationReady ? 'Live AI verification active' : 'Live verification is temporarily unavailable'}</b>
+          <small>{verificationReady ? 'CloudGuard verifies face match against your enrollment samples, anti-spoof liveness, and the spoken phrase. All three checks must pass.' : 'Live verification models are currently loading or unavailable. Please try again in a few moments.'}</small>
+        </span>
+        <span className={`verification-indicator ${verificationReady ? 'verification-ready' : ''}`}>
+          <span className="live-dot" /> {verificationReady ? 'AI ACTIVE' : 'UNAVAILABLE'}
+        </span>
+      </div>
 
-        {(state === 'ready' || state === 'recording' || state === 'recorded') && (
-          <div className="checkin-phrase">
-            <span className="eyebrow">READ THIS PHRASE ALOUD</span>
-            <p>"{sentence}"</p>
-            <small>Speak clearly and naturally while looking directly at the camera.</small>
+      <div className="checkin-layout">
+        <section className="surface checkin-flow">
+          <div className="section-title-row">
+            <div><span className="eyebrow">A MOMENT FOR YOU</span><h3>Complete a check-in</h3></div>
+            <span className="checkin-duration"><Icon name="clock" size={14} /> ABOUT 12 SEC</span>
           </div>
-        )}
 
-        {error && <div className="notice notice-error">{error}</div>}
-
-        {(state === 'idle' || state === 'permission_request') && (
-          <>
-            <div className="checkin-tips">
-              <Icon name="shield" size={15} />
-              <span>
-                <b>Tips for a successful check-in:</b>
-                <ul style={{ margin: '6px 0 0 0', paddingLeft: '18px', fontSize: '0.85em' }}>
-                  <li>Face the light source — good lighting is key.</li>
-                  <li>Centre your face clearly in the camera frame.</li>
-                  <li>Speak the phrase aloud at a natural pace.</li>
-                  <li>All three checks (face match, liveness, voice) must pass.</li>
-                </ul>
-              </span>
+          <div className="checkin-steps">
+            <div className={`checkin-step ${state !== 'idle' && state !== 'permission_request' ? 'step-done' : 'step-current'}`}>
+              <span>01</span><div><b>Allow camera & microphone</b><small>They’re used only for this check-in.</small></div>{(state !== 'idle' && state !== 'permission_request') && <span className="step-check">✓</span>}
             </div>
-            <div className="checkin-privacy">
-              <Icon name="lock" size={15} />
-              <span>Your recording is securely analyzed by this server and immediately deleted after processing.</span>
+            <div className={`checkin-step ${(state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') ? 'step-done' : state === 'ready' ? 'step-current' : ''}`}>
+              <span>02</span><div><b>Read your personal phrase</b><small>A new phrase is chosen each time.</small></div>{(state === 'recording' || state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') && <span className="step-check">✓</span>}
             </div>
-            <button
-              className="button button-primary"
-              onClick={requestPermissions}
-              disabled={state === 'permission_request'}
-            >
-              {state === 'permission_request' ? 'Requesting permissions...' : 'Allow camera & microphone'} <Icon name="arrow" size={17} />
-            </button>
-          </>
-        )}
-
-        {state === 'ready' && (
-          <div className="phrase-panel">
-            <div className="checkin-badges">
-              <span className="checkin-badge checkin-badge-ready">✓ Camera ready</span>
-              <span className="checkin-badge checkin-badge-ready">✓ Microphone ready</span>
+            <div className={`checkin-step ${(state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') ? 'step-done' : state === 'recording' ? 'step-current' : ''}`}>
+              <span>03</span><div><b>Record a short live clip</b><small>Keep your face in frame as you speak.</small></div>{(state === 'recorded' || state === 'submitting' || state === 'processing' || state === 'success' || state === 'failed') && <span className="step-check">✓</span>}
             </div>
-            <div className="checkin-guidance">
-              <div>• Keep your face inside the frame.</div>
-              <div>• Look at the camera and speak clearly.</div>
-            </div>
-            <div className="button-row" style={{ marginTop: '12px' }}>
-              <button className="button button-primary" onClick={startRecording}>
-                <span className="record-dot" /> Start check-in
-              </button>
-              <button className="button button-quiet" onClick={stopCamera}>Cancel</button>
+            <div className={`checkin-step ${state === 'success' || state === 'failed' || state === 'unavailable' ? 'step-current' : state === 'submitting' || state === 'processing' ? 'step-active' : ''}`}>
+              <span>04</span><div><b>Review your result</b><small>See whether verification passed.</small></div>{state === 'success' && <span className="step-check">✓</span>}
             </div>
           </div>
-        )}
 
-        {state === 'recording' && (
-          <div className="recording-panel">
-            <div className="checkin-badges" style={{ justifyContent: 'center' }}>
-              <span className="checkin-badge checkin-badge-ready">Camera ✓</span>
-              <span className="checkin-badge checkin-badge-ready">Microphone ✓</span>
-              <span className="checkin-badge checkin-badge-recording">Recording ●</span>
+          {(state === 'ready' || state === 'recording' || state === 'recorded') && (
+            <div className="checkin-phrase">
+              <span className="eyebrow">READ THIS PHRASE ALOUD</span>
+              <p>"{sentence}"</p>
+              <small>Speak clearly and naturally while looking directly at the camera.</small>
             </div>
-            <span className="recording-pulse" />
-            <b>Recording — read the phrase above aloud</b>
-            <span className="timer-count">{seconds}<small>sec</small></span>
-            <div className="recording-progress-bar"><span style={{ width: `${((12 - seconds) / 12) * 100}%` }} /></div>
-            <small>Speak naturally and keep your face centred in the camera.</small>
-            <div className="button-row" style={{ marginTop: '12px' }}>
-              <button className="button button-secondary" disabled>Recording in progress...</button>
-            </div>
-          </div>
-        )}
+          )}
 
-        {state === 'recorded' && (
-          <div className="phrase-panel">
-            <span className="eyebrow">RECORDING COMPLETE</span>
-            <div className="checkin-privacy">
-              <Icon name="shield" size={15} />
-              <span>{hasClip ? 'Your clip is ready for verification. Submit the clip to run face matching, anti-spoof liveness, and voice verification.' : 'No recording data was captured. Please record again.'}</span>
-            </div>
-            <div className="button-row">
-              <button
-                className="button button-primary"
-                onClick={saveCheckin}
-                disabled={!hasClip}
-              >
-                Verify check-in →
-              </button>
-              <button
-                className="button button-quiet"
-                onClick={handleTryAgain}
-              >
-                Try again
-              </button>
-            </div>
-          </div>
-        )}
+          {error && !permissionError && <div className="notice notice-error">{error}</div>}
 
-        {(state === 'submitting' || state === 'processing') && (
-          <div className="recording-panel">
-            <span className="recording-pulse" style={{ background: '#6366f1', boxShadow: '0 0 0 6px #e0e7ff' }} />
-            <b style={{ fontSize: '15px' }}>Analyzing face, liveness & voice...</b>
-            <small>Your recording has been securely submitted. This may take up to a minute.</small>
-            <div className="result-checks" style={{ marginTop: '14px', width: '100%', maxWidth: '370px' }}>
-              <div><span>Face matching</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>
-              <div><span>Anti-spoof liveness</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>
-              <div><span>Voice verification</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>
-            </div>
-            <div className="button-row" style={{ marginTop: '12px' }}>
-              <button className="button button-secondary" disabled>Analyzing face, liveness & voice...</button>
-            </div>
-          </div>
-        )}
+          {(state === 'idle' || state === 'permission_request') && (
+            <div className="permission-panel">
+              <div className="permission-header">
+                <span className="eyebrow">HARDWARE ACCESS</span>
+                <h3>Allow camera & microphone</h3>
+                <p>
+                  CloudGuard needs your camera to verify your face and your microphone to verify the spoken phrase. These are used only for this check-in.
+                </p>
+              </div>
 
-        {state === 'success' && verificationResult && (
-          <div className="result-panel">
-            <span className="result-checkin-icon"><Icon name="shield" size={23} /></span>
-            <span className="eyebrow">CHECK-IN RESULT</span>
-            <h3>Check-in verified successfully.</h3>
-            <p>Face matching, anti-spoof liveness, and voice verification all passed.</p>
-            <div className="overall-result">
-              <span>Verification status</span><b>PASSED</b>
-            </div>
-            <div className="result-checks">
-              <div><span>Face matching</span><b className="available-status">Passed</b></div>
-              <div><span>Anti-spoof liveness</span><b className="available-status">Passed</b></div>
-              <div><span>Voice verification</span><b className="available-status">Passed</b></div>
-            </div>
-            <div style={{ marginTop: '14px', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
-              <div><b>Check-in time:</b> {formatDate(verificationResult.checkinTime, { dateStyle: 'medium', timeStyle: 'short' })}</div>
-              {verificationResult.nextDeadline && (
-                <div style={{ marginTop: '4px' }}><b>Next check-in deadline:</b> {formatDate(verificationResult.nextDeadline, { dateStyle: 'medium', timeStyle: 'short' })}</div>
+              <div className="permission-requirements">
+                <div className="permission-item">
+                  <div className="permission-item-content">
+                    <Icon name="scan" size={18} style={{ color: '#4f46e5' }} />
+                    <b>Camera</b>
+                  </div>
+                  <span className="permission-item-badge">Required</span>
+                </div>
+                <div className="permission-item">
+                  <div className="permission-item-content">
+                    <Icon name="clock" size={18} style={{ color: '#4f46e5' }} />
+                    <b>Microphone</b>
+                  </div>
+                  <span className="permission-item-badge">Required</span>
+                </div>
+              </div>
+
+              {permissionError && (
+                <div className="permission-alert">
+                  <h4>{permissionError.title}</h4>
+                  <p>{permissionError.message}</p>
+                </div>
               )}
-            </div>
-            <div className="button-row" style={{ marginTop: '16px' }}>
-              <button className="button button-primary" onClick={() => { stopCamera(); if (onNavigate) onNavigate('dashboard') }}>
-                Return to dashboard <Icon name="arrow" size={17} />
-              </button>
-            </div>
-          </div>
-        )}
 
-        {state === 'failed' && verificationResult && (
-          <div className="result-panel">
-            <span className="result-checkin-icon" style={{ borderColor: 'var(--accent-red, #ef4444)' }}>
-              <Icon name="close" size={23} style={{ color: 'var(--accent-red, #ef4444)' }} />
-            </span>
-            <span className="eyebrow">CHECK-IN RESULT</span>
-            <h3>Check-in verification failed.</h3>
-            <p style={{ color: 'var(--accent-red, #dc2626)', fontWeight: 500 }}>{verificationResult.failureReason}</p>
-            <div className="overall-result">
-              <span>Verification status</span><b style={{ color: 'var(--accent-red, #dc2626)' }}>FAILED</b>
-            </div>
-            <div className="result-checks">
-              <div>
-                <span>Face matching</span>
-                <b className={verificationResult.checks.face === 'passed' ? 'available-status' : 'unavailable-status'}>
-                  {verificationResult.checks.face === 'passed' ? 'Passed' : 'Failed'}
-                </b>
+              <div className="button-row" style={{ marginTop: '16px' }}>
+                <button
+                  className="button button-primary"
+                  onClick={requestPermissions}
+                  disabled={state === 'permission_request'}
+                >
+                  {state === 'permission_request' ? 'Requesting permissions...' : 'Allow camera & microphone'} <Icon name="arrow" size={17} />
+                </button>
               </div>
-              <div>
-                <span>Anti-spoof liveness</span>
-                <b className={verificationResult.checks.liveness === 'passed' ? 'available-status' : 'unavailable-status'}>
-                  {verificationResult.checks.liveness === 'passed' ? 'Passed' : 'Failed'}
-                </b>
+
+              <div className="checkin-tips" style={{ marginTop: '20px' }}>
+                <Icon name="shield" size={15} />
+                <span>
+                  <b>Tips for a successful check-in:</b>
+                  <ul style={{ margin: '6px 0 0 0', paddingLeft: '18px', fontSize: '0.85em' }}>
+                    <li>Face the light source — good lighting is key.</li>
+                    <li>Centre your face clearly in the camera frame.</li>
+                    <li>Speak the phrase aloud at a natural pace.</li>
+                    <li>All three checks (face match, liveness, voice) must pass.</li>
+                  </ul>
+                </span>
               </div>
-              <div>
-                <span>Voice verification</span>
-                <b className={verificationResult.checks.voice === 'passed' ? 'available-status' : 'unavailable-status'}>
-                  {verificationResult.checks.voice === 'passed' ? 'Passed' : 'Failed'}
-                </b>
+              <div className="checkin-privacy" style={{ marginTop: '10px' }}>
+                <Icon name="lock" size={15} />
+                <span>Your recording is securely analyzed by this server and immediately deleted after processing.</span>
               </div>
             </div>
-            <div className="button-row" style={{ marginTop: '16px' }}>
-              <button className="button button-primary" onClick={handleTryAgain}>
-                Try again <Icon name="arrow" size={17} />
-              </button>
-            </div>
-          </div>
-        )}
+          )}
 
-        {state === 'unavailable' && verificationResult && (
-          <div className="result-panel">
-            <span className="result-checkin-icon" style={{ borderColor: 'var(--accent-amber, #f59e0b)' }}>
-              <Icon name="shield" size={23} style={{ color: 'var(--accent-amber, #f59e0b)' }} />
-            </span>
-            <span className="eyebrow">VERIFICATION UNAVAILABLE</span>
-            <h3>Live verification services are currently unavailable.</h3>
-            <p>{verificationResult.message}</p>
-            <div className="result-checks">
-              <div><span>Face matching</span><b className="unavailable-status">Unavailable</b></div>
-              <div><span>Anti-spoof liveness</span><b className="unavailable-status">Unavailable</b></div>
-              <div><span>Voice verification</span><b className="unavailable-status">Unavailable</b></div>
+          {state === 'ready' && (
+            <div className="phrase-panel">
+              <div className="checkin-badges">
+                <span className="checkin-badge checkin-badge-ready">✓ Camera ready</span>
+                <span className="checkin-badge checkin-badge-ready">✓ Microphone ready</span>
+              </div>
+              <div className="checkin-guidance">
+                <div>• Keep your face inside the frame.</div>
+                <div>• Look at the camera and speak clearly.</div>
+              </div>
+              <div className="button-row" style={{ marginTop: '12px' }}>
+                <button className="button button-primary" onClick={startRecording}>
+                  <span className="record-dot" /> Start check-in
+                </button>
+                <button className="button button-quiet" onClick={stopCamera}>Cancel</button>
+              </div>
             </div>
-            <div className="button-row" style={{ marginTop: '16px' }}>
-              <button className="button button-primary" onClick={handleTryAgain}>
-                Try again <Icon name="arrow" size={17} />
-              </button>
-            </div>
-          </div>
-        )}
+          )}
 
-        <video className={`checkin-video ${state === 'ready' || state === 'recording' || state === 'recorded' ? 'video-visible' : ''}`} ref={videoRef} autoPlay playsInline muted />
-      </section>
+          {state === 'recording' && (
+            <div className="recording-panel">
+              <div className="checkin-badges" style={{ justifyContent: 'center' }}>
+                <span className="checkin-badge checkin-badge-ready">Camera ✓</span>
+                <span className="checkin-badge checkin-badge-ready">Microphone ✓</span>
+                <span className="checkin-badge checkin-badge-recording">Recording ●</span>
+              </div>
+              <span className="recording-pulse" />
+              <b>Recording — read the phrase above aloud</b>
+              <span className="timer-count">{seconds}<small>sec</small></span>
+              <div className="recording-progress-bar"><span style={{ width: `${((12 - seconds) / 12) * 100}%` }} /></div>
+              <small>Speak naturally and keep your face centred in the camera.</small>
+              <div className="button-row" style={{ marginTop: '12px' }}>
+                <button className="button button-secondary" disabled>Recording in progress...</button>
+              </div>
+            </div>
+          )}
+
+          {state === 'recorded' && (
+            <div className="phrase-panel">
+              <span className="eyebrow">RECORDING COMPLETE</span>
+              <div className="checkin-privacy">
+                <Icon name="shield" size={15} />
+                <span>{hasClip ? 'Your clip is ready for verification. Submit the clip to run face matching, anti-spoof liveness, and voice verification.' : 'No recording data was captured. Please record again.'}</span>
+              </div>
+              <div className="button-row">
+                <button
+                  className="button button-primary"
+                  onClick={saveCheckin}
+                  disabled={!hasClip}
+                >
+                  Verify check-in →
+                </button>
+                <button
+                  className="button button-quiet"
+                  onClick={handleTryAgain}
+                >
+                  Try again
+                </button>
+              </div>
+            </div>
+          )}
+
+          {(state === 'submitting' || state === 'processing') && (
+            <div className="recording-panel">
+              <span className="recording-pulse" style={{ background: '#6366f1', boxShadow: '0 0 0 6px #e0e7ff' }} />
+              <b style={{ fontSize: '15px' }}>Analyzing face, liveness & voice...</b>
+              <small>Your recording has been securely submitted. This may take up to a minute.</small>
+              <div className="result-checks" style={{ marginTop: '14px', width: '100%', maxWidth: '370px' }}>
+                <div><span>Face matching</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>
+                <div><span>Anti-spoof liveness</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>
+                <div><span>Voice verification</span><b style={{ color: '#6366f1' }}>Analyzing...</b></div>
+              </div>
+              <div className="button-row" style={{ marginTop: '12px' }}>
+                <button className="button button-secondary" disabled>Analyzing face, liveness & voice...</button>
+              </div>
+            </div>
+          )}
+
+          {state === 'success' && verificationResult && (
+            <div className="result-panel">
+              <span className="result-checkin-icon"><Icon name="shield" size={23} /></span>
+              <span className="eyebrow">CHECK-IN RESULT</span>
+              <h3>Check-in verified successfully.</h3>
+              <p>Face matching, anti-spoof liveness, and voice verification all passed.</p>
+              <div className="overall-result">
+                <span>Verification status</span><b>PASSED</b>
+              </div>
+              <div className="result-checks">
+                <div><span>Face matching</span><b className="available-status">Passed</b></div>
+                <div><span>Anti-spoof liveness</span><b className="available-status">Passed</b></div>
+                <div><span>Voice verification</span><b className="available-status">Passed</b></div>
+              </div>
+              <div style={{ marginTop: '14px', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                <div><b>Check-in time:</b> {formatDate(verificationResult.checkinTime, { dateStyle: 'medium', timeStyle: 'short' })}</div>
+                {verificationResult.nextDeadline && (
+                  <div style={{ marginTop: '4px' }}><b>Next check-in deadline:</b> {formatDate(verificationResult.nextDeadline, { dateStyle: 'medium', timeStyle: 'short' })}</div>
+                )}
+              </div>
+              <div className="button-row" style={{ marginTop: '16px' }}>
+                <button className="button button-primary" onClick={() => { stopCamera(); if (onNavigate) onNavigate('dashboard') }}>
+                  Return to dashboard <Icon name="arrow" size={17} />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {state === 'failed' && verificationResult && (
+            <div className="result-panel">
+              <span className="result-checkin-icon" style={{ borderColor: 'var(--accent-red, #ef4444)' }}>
+                <Icon name="close" size={23} style={{ color: 'var(--accent-red, #ef4444)' }} />
+              </span>
+              <span className="eyebrow">CHECK-IN RESULT</span>
+              <h3>Check-in verification failed.</h3>
+              <p style={{ color: 'var(--accent-red, #dc2626)', fontWeight: 500 }}>{verificationResult.failureReason}</p>
+              <div className="overall-result">
+                <span>Verification status</span><b style={{ color: 'var(--accent-red, #dc2626)' }}>FAILED</b>
+              </div>
+              <div className="result-checks">
+                <div>
+                  <span>Face matching</span>
+                  <b className={verificationResult.checks.face === 'passed' ? 'available-status' : 'unavailable-status'}>
+                    {verificationResult.checks.face === 'passed' ? 'Passed' : 'Failed'}
+                  </b>
+                </div>
+                <div>
+                  <span>Anti-spoof liveness</span>
+                  <b className={verificationResult.checks.liveness === 'passed' ? 'available-status' : 'unavailable-status'}>
+                    {verificationResult.checks.liveness === 'passed' ? 'Passed' : 'Failed'}
+                  </b>
+                </div>
+                <div>
+                  <span>Voice verification</span>
+                  <b className={verificationResult.checks.voice === 'passed' ? 'available-status' : 'unavailable-status'}>
+                    {verificationResult.checks.voice === 'passed' ? 'Passed' : 'Failed'}
+                  </b>
+                </div>
+              </div>
+              <div className="button-row" style={{ marginTop: '16px' }}>
+                <button className="button button-primary" onClick={handleTryAgain}>
+                  Try again <Icon name="arrow" size={17} />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {state === 'unavailable' && verificationResult && (
+            <div className="result-panel">
+              <span className="result-checkin-icon" style={{ borderColor: 'var(--accent-amber, #f59e0b)' }}>
+                <Icon name="shield" size={23} style={{ color: 'var(--accent-amber, #f59e0b)' }} />
+              </span>
+              <span className="eyebrow">VERIFICATION UNAVAILABLE</span>
+              <h3>Live verification services are currently unavailable.</h3>
+              <p>{verificationResult.message}</p>
+              <div className="result-checks">
+                <div><span>Face matching</span><b className="unavailable-status">Unavailable</b></div>
+                <div><span>Anti-spoof liveness</span><b className="unavailable-status">Unavailable</b></div>
+                <div><span>Voice verification</span><b className="unavailable-status">Unavailable</b></div>
+              </div>
+              <div className="button-row" style={{ marginTop: '16px' }}>
+                <button className="button button-primary" onClick={handleTryAgain}>
+                  Try again <Icon name="arrow" size={17} />
+                </button>
+              </div>
+            </div>
+          )}
+
+          <video
+            className={`checkin-video ${state === 'ready' || state === 'recording' || state === 'recorded' ? 'video-visible' : ''}`}
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+          />
+        </section>
+
       <aside className="checkin-aside">
         <section className="surface aside-card">
           <span className="aside-icon"><Icon name="shield" size={19} /></span>
@@ -3488,6 +3630,7 @@ function Checkin({ token, onComplete, onNavigate }) {
       </aside>
     </div>
   </div>
+  )
 }
 
 

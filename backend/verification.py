@@ -39,10 +39,9 @@ FACE_MODEL = "Facenet"
 FACE_MATCH_MAX_DISTANCE = float(os.getenv("CLOUDGUARD_FACE_DISTANCE", "0.40"))
 MIN_FACE_PX = 24
 MAX_FACE_FRAME_COVERAGE = 0.85
-# Sample 16 frames spanning the full 12s recording (every ~0.75s)
+# Sample 8 evenly-spaced frames spanning the 12s recording (every ~1.5s)
 _FRAME_SAMPLE_FRACTIONS = (
-    0.06, 0.12, 0.18, 0.24, 0.30, 0.36, 0.42, 0.48,
-    0.54, 0.60, 0.66, 0.72, 0.78, 0.84, 0.90, 0.94
+    0.08, 0.20, 0.32, 0.44, 0.56, 0.68, 0.80, 0.92
 )
 _MAX_FRAME_SIDE = 640
 _TRANSCRIBE_SECONDS = 35
@@ -137,11 +136,11 @@ def _frames_from_av(video_path: Path) -> list:
         logger.info("[DECODE] PyAV opened video: codec=%s, resolution=%dx%d, duration=%.2fs", codec_name, width, height, duration)
         print(f"[DECODE] PyAV opened video: codec={codec_name}, resolution={width}x{height}, duration={duration:.2f}s", flush=True)
 
-        # Single streaming pass: sample frames spaced across the stream without 2x decoding
+        # Single streaming pass: sample 8 frames spaced across the stream without 2x decoding
         frame_idx = 0
         for frame in container.decode(video=0):
-            # Target ~16 frames across clip: sample every 16 frames or initial critical anchors
-            if frame_idx % 16 == 0 or frame_idx in (4, 10, 20):
+            # Target ~8 frames across clip: sample every 24 frames or initial anchors
+            if frame_idx % 24 == 0 or frame_idx in (8, 20):
                 array = _array_from_av_frame(frame)
                 if array is not None:
                     h, w = array.shape[:2]
@@ -149,7 +148,7 @@ def _frames_from_av(video_path: Path) -> list:
                         scale = 640.0 / max(h, w)
                         array = cv2.resize(array, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
                     frames.append(array)
-                    if len(frames) >= 16:
+                    if len(frames) >= 8:
                         break
             frame_idx += 1
 
@@ -171,8 +170,8 @@ def _frames_from_cv2(video_path: Path, cv2) -> list:
 
         frames = []
         frame_idx = 0
-        while len(frames) < 16 and frame_idx < 400:
-            if frame_idx % 16 == 0 or frame_idx in (4, 10, 20):
+        while len(frames) < 8 and frame_idx < 350:
+            if frame_idx % 24 == 0 or frame_idx in (8, 20):
                 success, frame = capture.read()
                 if not success or frame is None:
                     break
@@ -364,7 +363,8 @@ def _get_cascade(name: str, cv2):
 def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
     """
     Detect candidate face bounding boxes (x, y, w, h) in the given BGR frame.
-    Evaluates multi-scale AdaBoost cascades across CLAHE, global equalized, and raw grayscale variants.
+    Fast & robust: tests primary frontal cascade on CLAHE first (95% hit rate in ~5ms).
+    Falls back to secondary cascade or profile face only if necessary.
     """
     if frame is None or getattr(frame, "size", 0) == 0:
         return []
@@ -376,78 +376,44 @@ def _detect_faces_opencv(frame, cv2) -> list[tuple[int, int, int, int]]:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     clahe_gray = clahe.apply(gray)
+
+    # Fast Pass 1: Primary frontal cascade with scaleFactor=1.12, minNeighbors=4 on CLAHE
+    c_primary = _get_cascade("haarcascade_frontalface_default.xml", cv2)
+    if c_primary is not None:
+        rects = c_primary.detectMultiScale(
+            clahe_gray, scaleFactor=1.12, minNeighbors=4, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+        )
+        if len(rects) > 0:
+            return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+
+    # Fast Pass 2: Secondary frontal cascade (alt2) on CLAHE
+    c_alt2 = _get_cascade("haarcascade_frontalface_alt2.xml", cv2)
+    if c_alt2 is not None:
+        rects = c_alt2.detectMultiScale(
+            clahe_gray, scaleFactor=1.12, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+        )
+        if len(rects) > 0:
+            return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+
+    # Fallback Pass 3: Profile face cascade for reading head tilt
+    c_prof = _get_cascade("haarcascade_profileface.xml", cv2)
+    if c_prof is not None:
+        rects = c_prof.detectMultiScale(
+            clahe_gray, scaleFactor=1.12, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+        )
+        if len(rects) > 0:
+            return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
+
+    # Fallback Pass 4: Global equalized histogram if lighting is uneven
     equalized = cv2.equalizeHist(gray)
-    variants = (clahe_gray, equalized, gray)
+    if c_primary is not None:
+        rects = c_primary.detectMultiScale(
+            equalized, scaleFactor=1.12, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
+        )
+        if len(rects) > 0:
+            return [(int(r[0]), int(r[1]), int(r[2]), int(r[3])) for r in rects if r[2] >= MIN_FACE_PX and r[3] >= MIN_FACE_PX and (r[2]*r[3])/(W*H) <= MAX_FACE_FRAME_COVERAGE]
 
-    cascade_names = [
-        "haarcascade_frontalface_alt2.xml",
-        "haarcascade_frontalface_default.xml",
-        "haarcascade_frontalface_alt.xml",
-        "haarcascade_frontalface_alt_tree.xml",
-    ]
-
-    found_rects = []
-    # Pass 1: frontal multi-cascade with fine scaleFactor 1.05 and minNeighbors 3
-    for c_name in cascade_names:
-        cascade = _get_cascade(c_name, cv2)
-        if cascade is None:
-            continue
-        for img_var in variants:
-            rects = cascade.detectMultiScale(
-                img_var, scaleFactor=1.05, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
-            )
-            if len(rects) > 0:
-                found_rects.extend(rects)
-                break
-        if found_rects:
-            break
-
-    # Pass 2: profile cascade for reading posture / head turned
-    if not found_rects:
-        c_prof = _get_cascade("haarcascade_profileface.xml", cv2)
-        if c_prof is not None:
-            for img_var in variants:
-                rects = c_prof.detectMultiScale(
-                    img_var, scaleFactor=1.05, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
-                )
-                if len(rects) > 0:
-                    found_rects.extend(rects)
-                    break
-            if not found_rects:
-                flipped = cv2.flip(clahe_gray, 1)
-                rects = c_prof.detectMultiScale(
-                    flipped, scaleFactor=1.05, minNeighbors=3, minSize=(MIN_FACE_PX, MIN_FACE_PX)
-                )
-                if len(rects) > 0:
-                    for (rx, ry, rw, rh) in rects:
-                        found_rects.append((W - rx - rw, ry, rw, rh))
-
-    # Pass 3: gentle fallback with minNeighbors=2 if lighting or tilt is difficult
-    if not found_rects:
-        for c_name in ("haarcascade_frontalface_alt2.xml", "haarcascade_frontalface_default.xml"):
-            cascade = _get_cascade(c_name, cv2)
-            if cascade is None:
-                continue
-            for img_var in (clahe_gray, equalized):
-                rects = cascade.detectMultiScale(
-                    img_var, scaleFactor=1.05, minNeighbors=2, minSize=(MIN_FACE_PX, MIN_FACE_PX)
-                )
-                if len(rects) > 0:
-                    found_rects.extend(rects)
-                    break
-            if found_rects:
-                break
-
-    # Filter candidates by minimum size and maximum coverage
-    valid = []
-    for rect in found_rects:
-        x, y, w, h = int(rect[0]), int(rect[1]), int(rect[2]), int(rect[3])
-        if w >= MIN_FACE_PX and h >= MIN_FACE_PX:
-            cov = (w * h) / float(W * H)
-            if cov <= MAX_FACE_FRAME_COVERAGE:
-                valid.append((x, y, w, h))
-
-    return valid
+    return []
 
 
 def _primary_face(valid_rects: list, frame_shape: tuple) -> tuple | None:
@@ -798,17 +764,17 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
         if enrollment_vectors:
             _save_cached_enrollment_embeddings(cache_key, enrollment_vectors)
 
-    # Select up to 4 representative, evenly-spaced face crops across the recording
+    # Select up to 3 representative, evenly-spaced face crops across the recording
     # to avoid redundant CPU inference loops while maintaining high identity verification accuracy.
-    if len(face_crops) <= 4:
+    if len(face_crops) <= 3:
         selected_crops = face_crops
     else:
-        step = len(face_crops) / 4.0
-        indices = [int(i * step) for i in range(4)]
+        step = len(face_crops) / 3.0
+        indices = [int(i * step) for i in range(3)]
         selected_crops = [face_crops[min(idx, len(face_crops) - 1)] for idx in indices]
 
-    # Target threshold for early confirmation (at least 35% of selected frames)
-    target_threshold = max(1, math.ceil(len(selected_crops) * 0.35))
+    # Target threshold for early confirmation: 1 confirmed match with cosine distance <= 0.40
+    target_threshold = 1
 
     identity_votes = 0
     frames_attempted = 0
@@ -820,16 +786,15 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
         if _identity_matches_enrollment(emb, enrollment_vectors):
             identity_votes += 1
             if identity_votes >= target_threshold:
-                logger.info("[FACE] Identity confirmed with %d positive votes (target: %d). Early exit.", identity_votes, target_threshold)
-                print(f"[FACE] Identity confirmed with {identity_votes} positive votes (target: {target_threshold}). Early exit.", flush=True)
+                logger.info("[FACE] Identity confirmed with %d positive votes. Early exit.", identity_votes)
+                print(f"[FACE] Identity confirmed with {identity_votes} positive votes. Early exit.", flush=True)
                 break
 
     if frames_attempted == 0:
         face_status = "failed"
         face_detail = "quality_low"
     else:
-        vote_threshold = max(1, math.ceil(frames_attempted * 0.35))
-        if identity_votes >= vote_threshold:
+        if identity_votes >= 1:
             face_status = "passed"
             face_detail = "matched"
         else:

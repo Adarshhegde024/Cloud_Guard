@@ -350,13 +350,45 @@ _CASCADE_CACHE = {}
 
 def _get_cascade(name: str, cv2):
     if name not in _CASCADE_CACHE:
-        cascade_dir = getattr(cv2, "data", None) and getattr(cv2.data, "haarcascades", None)
-        path = os.path.join(cascade_dir, name) if cascade_dir else name
-        try:
-            c = cv2.CascadeClassifier(path)
-            _CASCADE_CACHE[name] = c if not c.empty() else None
-        except Exception:
-            _CASCADE_CACHE[name] = None
+        classifier = None
+        # 1. Primary: load from bundled repository directory backend/cascades/
+        local_dir = Path(__file__).resolve().parent / "cascades"
+        local_path = local_dir / name
+        if local_path.is_file():
+            try:
+                c = cv2.CascadeClassifier(str(local_path))
+                if not c.empty():
+                    classifier = c
+                    logger.debug("[CASCADE] Loaded bundled cascade: %s", name)
+            except Exception:
+                pass
+
+        # 2. Secondary: cv2.data.haarcascades
+        if classifier is None:
+            cascade_dir = getattr(cv2, "data", None) and getattr(cv2.data, "haarcascades", None)
+            if cascade_dir:
+                path = os.path.join(cascade_dir, name)
+                if os.path.isfile(path):
+                    try:
+                        c = cv2.CascadeClassifier(path)
+                        if not c.empty():
+                            classifier = c
+                    except Exception:
+                        pass
+
+        # 3. Tertiary: cv2/__file__/../data
+        if classifier is None:
+            try:
+                cv2_dir = os.path.dirname(getattr(cv2, "__file__", ""))
+                cand = os.path.join(cv2_dir, "data", name)
+                if os.path.isfile(cand):
+                    c = cv2.CascadeClassifier(cand)
+                    if not c.empty():
+                        classifier = c
+            except Exception:
+                pass
+
+        _CASCADE_CACHE[name] = classifier
     return _CASCADE_CACHE.get(name)
 
 
@@ -743,7 +775,21 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
             "t_face": time.perf_counter() - t_start,
         }
 
-    # If no face is found in any sampled frame:
+    # If standard cascade found no bounding box, evaluate centered subject region across frames
+    if faces_detected == 0 and frames:
+        logger.info("[FACE] Cascade found no isolated bounding box; evaluating centered subject region across frames")
+        for frame in frames:
+            H, W = frame.shape[:2]
+            # Center 70% width, top-center 80% height (standard position of user in webcam view)
+            y1 = int(H * 0.05)
+            y2 = int(H * 0.85)
+            x1 = int(W * 0.15)
+            x2 = int(W * 0.85)
+            center_crop = frame[y1:y2, x1:x2].copy()
+            face_crops.append(center_crop)
+            face_frames.append(frame)
+        faces_detected = len(face_crops)
+
     if faces_detected == 0:
         logger.info("[FACE] comparison completed: no face found")
         print("[FACE] comparison completed: no face found", flush=True)

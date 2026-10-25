@@ -2947,7 +2947,7 @@ function Checkin({ token, onComplete, onNavigate }) {
         return
       }
 
-      const isPassed = Boolean(response.success || response.passed || response.status === 'success')
+      const isPassed = Boolean(response.success || response.passed || response.status === 'success' || response.status === 'verified')
 
       if (isPassed) {
         setState('success')
@@ -3482,7 +3482,7 @@ function History({ data = [], token }) {
         <div className="history-summary"><div><span className="eyebrow">YOUR PRIVATE RECORD</span><b>{data.length}</b><small>{data.length === 1 ? 'check-in saved' : 'check-ins saved'}</small></div><span className="history-summary-icon"><Icon name="clock" size={23} /></span></div>
         <section className="surface history-surface"><div className="section-title-row"><div><span className="eyebrow">ACTIVITY</span><h3>Recent check-ins</h3></div><span className="soft-tag">LATEST 100</span></div>
           {data.length ? <div className="history-list">{data.map((item, index) => {
-            const passed = item.status === 'success'
+            const passed = item.status === 'success' || item.status === 'verified'
             const verifiedFailure = item.status === 'failed'
             const verificationLabel = passed ? 'PASSED' : verifiedFailure ? 'NOT PASSED' : 'NOT VERIFIED'
             const checkLabel = (value) => ({ passed: 'Passed', failed: 'Failed', not_configured: 'Not checked', demo: 'Not checked' }[value] || value)

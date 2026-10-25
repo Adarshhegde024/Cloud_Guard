@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import tempfile
+import time
+import hashlib
 from functools import lru_cache
 from pathlib import Path
 
@@ -524,6 +526,44 @@ def _check_frame_liveness(frames, cv2) -> bool:
     return bool(avg_sharpness >= 35.0 and max_motion >= 0.8)
 
 
+def _enrollment_cache_key(encoded_samples: list[str]) -> str:
+    h = hashlib.sha256()
+    for s in encoded_samples:
+        h.update(s.encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def _get_cached_enrollment_embeddings(cache_key: str) -> list | None:
+    cache_dir = Path(tempfile.gettempdir()) / "cloudguard_embeddings"
+    cache_file = cache_dir / f"{cache_key}.json"
+    if cache_file.exists():
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list) and len(data) >= 2:
+                    return data
+        except Exception:
+            pass
+    return None
+
+
+def _save_cached_enrollment_embeddings(cache_key: str, embeddings: list) -> None:
+    try:
+        cache_dir = Path(tempfile.gettempdir()) / "cloudguard_embeddings"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / f"{cache_key}.json"
+        serializable = []
+        for vec in embeddings:
+            if hasattr(vec, "tolist"):
+                serializable.append(vec.tolist())
+            elif isinstance(vec, (list, tuple)):
+                serializable.append([float(x) for x in vec])
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(serializable, f)
+    except Exception as exc:
+        logger.debug("Could not cache enrollment embeddings: %s", exc)
+
+
 def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) -> dict:
     """Evaluate face match and liveness in an isolated worker process."""
     try:
@@ -535,7 +575,14 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
             f"Local verification models are unavailable: {error}"
         ) from error
 
+    t_start = time.perf_counter()
+    logger.info("[FACE] enrollment samples loaded: %d", len(encoded_samples))
+    print(f"[FACE] enrollment samples loaded: {len(encoded_samples)}", flush=True)
+
     raw_frames = _video_frames(video_path, cv2)
+    logger.info("[FACE] usable video frames detected: %d", len(raw_frames))
+    print(f"[FACE] usable video frames detected: {len(raw_frames)}", flush=True)
+
     frames = [_shrink_frame(frame, cv2) for frame in raw_frames]
 
     # Fast face extraction using lightweight OpenCV Haar cascade
@@ -545,21 +592,41 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
         if detected and len(detected) == 1:
             live_frames.append(frame)
 
+    face_detected = len(live_frames) > 0
+    logger.info("[FACE] face detected: %s", "true" if face_detected else "false")
+    print(f"[FACE] face detected: {'true' if face_detected else 'false'}", flush=True)
+
     # If no face is found in the check-in recording, reject immediately without loading embeddings
     if not live_frames:
+        logger.info("[FACE] comparison completed")
+        print("[FACE] comparison completed", flush=True)
         return {
             "face_status": "failed",
             "face_detail": "no_face",
             "liveness_status": "failed",
+            "enrollment_samples_count": len(encoded_samples),
+            "usable_frames_count": len(raw_frames),
+            "face_detected": False,
+            "t_liveness": 0.001,
+            "t_face": time.perf_counter() - t_start,
         }
 
     # Evaluate optical anti-spoof liveness on the candidate frames
+    t_live_start = time.perf_counter()
     liveness_passed = _check_frame_liveness(live_frames, cv2)
     liveness_status = "passed" if liveness_passed else "failed"
+    t_liveness = time.perf_counter() - t_live_start
 
-    # Only when a face is present, compute reference embeddings and match
-    enrollment_images = [_shrink_frame(image, cv2) for image in _enrollment_images(encoded_samples, cv2)]
-    enrollment_vectors = _enrollment_embeddings(DeepFace, cv2, enrollment_images)
+    # Check cache for enrollment embeddings
+    cache_key = _enrollment_cache_key(encoded_samples)
+    cached_vectors = _get_cached_enrollment_embeddings(cache_key)
+    if cached_vectors is not None:
+        enrollment_vectors = cached_vectors
+    else:
+        enrollment_images = [_shrink_frame(image, cv2) for image in _enrollment_images(encoded_samples, cv2)]
+        enrollment_vectors = _enrollment_embeddings(DeepFace, cv2, enrollment_images)
+        if enrollment_vectors:
+            _save_cached_enrollment_embeddings(cache_key, enrollment_vectors)
 
     identity_votes = 0
     frames_attempted = 0
@@ -576,11 +643,18 @@ def _evaluate_face_and_liveness(video_path: Path, encoded_samples: list[str]) ->
             identity_votes += 1
 
     face_status, face_detail = _decide_face_outcome(identity_votes, frames_attempted)
+    logger.info("[FACE] comparison completed")
+    print("[FACE] comparison completed", flush=True)
 
     return {
         "face_status": face_status,
         "face_detail": face_detail,
         "liveness_status": liveness_status,
+        "enrollment_samples_count": len(encoded_samples),
+        "usable_frames_count": len(raw_frames),
+        "face_detected": True,
+        "t_liveness": t_liveness,
+        "t_face": time.perf_counter() - t_start,
     }
 
 
@@ -670,9 +744,15 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
             env=env,
             timeout=45,
         )
+        face_result = None
         for line in proc.stdout.splitlines():
-            if line.startswith("__FACE_RESULT__:"):
-                return json.loads(line.split("__FACE_RESULT__:", 1)[1].strip())
+            line_str = line.strip()
+            if line_str.startswith("[FACE]"):
+                logger.info(line_str)
+            elif line_str.startswith("__FACE_RESULT__:"):
+                face_result = json.loads(line_str.split("__FACE_RESULT__:", 1)[1].strip())
+        if face_result is not None:
+            return face_result
         logger.warning("Face worker output: %s (err: %s)", proc.stdout, proc.stderr)
     except Exception as exc:
         logger.warning("Face worker error: %s", exc)
@@ -681,41 +761,51 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
             os.remove(samples_file)
         except OSError:
             pass
-    return {"face_status": "failed", "face_detail": "no_face", "liveness_status": "failed"}
+    return {"face_status": "failed", "face_detail": "no_face", "liveness_status": "failed", "t_liveness": 0.0, "t_face": 0.0}
 
 
 def verify_recording(
     video_path: Path, encoded_samples: list[str], sentence: str
-) -> dict[str, str]:
+) -> dict:
     """
     Run face-match, liveness, and speech verification on a check-in recording.
 
     Returns a dict with keys ``face_status``, ``liveness_status``, ``speech_status``
-    each set to ``"passed"`` or ``"failed"``, plus ``face_detail``.
+    each set to ``"passed"`` or ``"failed"``, plus ``face_detail`` and ``timings``.
     """
     try:
         if not providers_available():
             raise VerificationUnavailable("Local verification models are unavailable.")
 
-        # 1. Transcribe speech in isolated worker process (memory freed upon exit)
+        # 1. Face verification & liveness in isolated worker process (memory freed upon exit)
+        t_face_start = time.perf_counter()
+        logger.info("[CHECKIN] face verification started")
+        face_res = _run_face_subprocess(video_path, encoded_samples)
+        logger.info("[CHECKIN] face verification completed")
+        t_face = time.perf_counter() - t_face_start
+
+        logger.info("[CHECKIN] liveness verification started")
+        t_liveness = float(face_res.get("t_liveness", 0.005))
+        logger.info("[CHECKIN] liveness verification completed")
+
+        # 2. Transcribe speech in isolated worker process (memory freed upon exit)
+        t_speech_start = time.perf_counter()
         logger.info("[CHECKIN] speech verification started")
         transcript = _run_speech_subprocess(video_path)
         speech_status = "passed" if _phrase_matches(sentence, transcript) else "failed"
         logger.info("[CHECKIN] speech verification completed")
-
-        # 2. Evaluate face match & liveness in isolated worker process (memory freed upon exit)
-        logger.info("[CHECKIN] face verification started")
-        face_res = _run_face_subprocess(video_path, encoded_samples)
-        logger.info("[CHECKIN] face verification completed")
-
-        logger.info("[CHECKIN] liveness verification started")
-        logger.info("[CHECKIN] liveness verification completed")
+        t_speech = time.perf_counter() - t_speech_start
 
         result = {
             "face_status": face_res.get("face_status", "failed"),
             "face_detail": face_res.get("face_detail", "no_face"),
             "liveness_status": face_res.get("liveness_status", "failed"),
             "speech_status": speech_status,
+            "timings": {
+                "face": t_face,
+                "liveness": t_liveness,
+                "speech": t_speech,
+            },
         }
         logger.info(
             "Verification result – face: %s (%s), liveness: %s, speech: %s",

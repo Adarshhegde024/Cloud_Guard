@@ -22,6 +22,7 @@ from psycopg2.extras import DictCursor
 from psycopg2 import errors as pg_errors
 from psycopg2 import IntegrityError as PGIntegrityError
 import tempfile
+import time
 from contextlib import asynccontextmanager, contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -3684,7 +3685,9 @@ def create_checkin(
     recording: UploadFile = File(...),
     user: dict = Depends(current_user),
 ):
+    t_start = time.perf_counter()
     logger.info("[CHECKIN] request received")
+    logger.info("[CHECKIN] authenticated owner: %s", user["id"])
     if sentence not in CHECKIN_SENTENCES:
         logger.warning("[CHECKIN ERROR] The check-in phrase is not valid.")
         raise HTTPException(status_code=422, detail="The check-in phrase is not valid. Start a new check-in and try again.")
@@ -3716,6 +3719,7 @@ def create_checkin(
         raise HTTPException(status_code=413, detail="Check-in recordings must be 20 MB or smaller.")
     
     logger.info("[CHECKIN] recording received")
+    logger.info("[CHECKIN] recording size: %d bytes", len(data))
 
     with db() as connection:
         owner = connection.execute(
@@ -3735,6 +3739,7 @@ def create_checkin(
         video_path = Path(directory) / f"recording{suffix}"
         video_path.write_bytes(data)
         logger.info("[CHECKIN] temporary file created")
+        t_upload = time.perf_counter() - t_start
         try:
             statuses = verify_recording(video_path, enrollment_samples, sentence)
             required = {"face_status", "liveness_status", "speech_status"}
@@ -3798,6 +3803,7 @@ def create_checkin(
     if not passed:
         logger.warning("[CHECKIN ERROR] %s", message)
 
+    t_db_start = time.perf_counter()
     with db() as connection:
         cursor = connection.execute(
             """INSERT INTO checkins(owner_id,mode,status,face_status,liveness_status,speech_status,sentence,created_at)
@@ -3858,6 +3864,19 @@ def create_checkin(
             logger.info("[CHECKIN] check-in saved")
 
         row = connection.execute("SELECT * FROM checkins WHERE id=?", (cursor.lastrowid,)).fetchone()
+    t_db = time.perf_counter() - t_db_start
+
+    t_timings = statuses.get("timings", {})
+    t_face = float(t_timings.get("face", 0.0))
+    t_liveness = float(t_timings.get("liveness", 0.0))
+    t_speech = float(t_timings.get("speech", 0.0))
+    t_total = time.perf_counter() - t_start
+
+    logger.info(
+        "[TIMING] upload=%.3fs face=%.3fs liveness=%.3fs speech=%.3fs database=%.3fs total=%.3fs",
+        t_upload, t_face, t_liveness, t_speech, t_db, t_total
+    )
+    logger.info("[CHECKIN] response being returned")
 
     checkin = dict(row)
     checkin["face_detail"] = face_detail
@@ -3872,7 +3891,7 @@ def create_checkin(
         return {
             "success": True,
             "passed": True,
-            "status": "success",
+            "status": "verified",
             "message": "Check-in verified successfully.",
             "checks": checks,
             "checkin": checkin,

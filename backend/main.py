@@ -1720,6 +1720,7 @@ def health() -> dict:
         "status": "ok" if db_connected else "degraded",
         "service": "CloudGuard Vault API",
         "version": "1.0.0",
+        "build_id": "v1.0.3-fast-verify",
         "database": "postgresql",
         "database_connected": db_connected,
         "verification_mode": "local" if configured else "unavailable",

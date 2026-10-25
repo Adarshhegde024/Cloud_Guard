@@ -1050,8 +1050,11 @@ def _run_face_subprocess(video_path: Path, encoded_samples: list[str]) -> dict:
                 f"Face verification service is temporarily unavailable: {worker_error or 'process terminated'}"
             )
     except subprocess.TimeoutExpired as exc:
-        logger.error("Face worker timed out: %s", exc)
-        raise VerificationUnavailable("Face verification timed out.") from exc
+        stdout_str = exc.stdout.decode('utf-8', errors='replace') if isinstance(exc.stdout, bytes) else str(exc.stdout or '')
+        stderr_str = exc.stderr.decode('utf-8', errors='replace') if isinstance(exc.stderr, bytes) else str(exc.stderr or '')
+        last_line = stdout_str.strip().splitlines()[-1] if stdout_str.strip().splitlines() else "none"
+        logger.error("Face worker timed out: %s. Last output: %s (err: %s)", exc, last_line, stderr_str)
+        raise VerificationUnavailable(f"Face verification timed out at step: {last_line}") from exc
     except Exception as exc:
         logger.warning("Face worker error: %s", exc)
         if isinstance(exc, VerificationUnavailable):
